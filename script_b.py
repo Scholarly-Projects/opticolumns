@@ -1,25 +1,15 @@
 #!/usr/bin/env python3
 """
-Opticolumn - Surya Edition
-OCR pipeline using Surya for layout detection, reading order, and TrOCR for text recognition.
-
-Pipeline:
-  LayoutPredictor  → column/region boundaries (handles narrow gutters automatically)
-  DetectionPredictor → individual text line bboxes
-  OrderPredictor   → reading order informed by layout regions
-  TrOCR            → text recognition per line
+Opticolumn - Surya Segmentation + TrOCR Recognition (Segment Isolated)
 """
 
 import sys
 import os
-import tempfile
 from pathlib import Path
 import fitz  # PyMuPDF
-from io import BytesIO
-from PIL import Image, ImageEnhance, ImageFilter, ImageOps
-import numpy as np
+from PIL import Image, ImageFilter, ImageOps
 import logging
-from typing import List, Tuple, Dict, Any
+from typing import List, Optional
 import torch
 from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 import re
@@ -28,50 +18,30 @@ import datetime
 import shutil
 import pikepdf
 
-# Surya imports
-# Note: this version of Surya does not ship surya.ordering / OrderPredictor.
-# Reading order is derived from LayoutPredictor column regions instead —
-# see get_ordered_text_lines() for the full explanation.
+# ── Surya imports ───────
 from surya.foundation import FoundationPredictor
 from surya.detection import DetectionPredictor
-from surya.layout import LayoutPredictor
-from surya.settings import settings
 
 # ─────────────────────────── Configuration ───────────────────────────────────
 INPUT_DIR  = "A"
 OUTPUT_DIR = "B"
 MODELS_DIR = "mlmodels"
 POPPLER_PATH = None
-
-# Raised from 200 → 300 so that ~6pt body text on the 1916 paper
-# resolves to ~25 px line height, giving TrOCR enough pixels to work with.
-# Modern/wider-column papers are unaffected by the higher DPI.
-DPI = 300
-
+DPI = 200
 TROCR_MODELS = {
     "handwritten":       "microsoft/trocr-base-handwritten",
     "printed":           "microsoft/trocr-base-printed",
     "large_handwritten": "microsoft/trocr-large-handwritten",
     "large_printed":     "microsoft/trocr-large-printed",
 }
-TROCR_MODEL_NAME = TROCR_MODELS["large_handwritten"]
-
-ENABLE_PREPROCESSING = True   # affects OCR copy only, not stored images
-
-# Slightly more lenient than before to accommodate aged / degraded newsprint ink.
-CONFIDENCE_THRESHOLD             = 0.22   # was 0.25
-SINGLE_CHAR_CONFIDENCE_THRESHOLD = 0.45   # was 0.50
-
-# Scaled up from 10 → 12 to match the higher DPI
-MIN_SEGMENT_HEIGHT = 12
-
+TROCR_MODEL_NAME                 = TROCR_MODELS["large_handwritten"]
+ENABLE_PREPROCESSING             = True   
+CONFIDENCE_THRESHOLD             = 0.25
+SINGLE_CHAR_CONFIDENCE_THRESHOLD = 0.5
+MIN_SEGMENT_HEIGHT               = 10
 FONT_NAME     = "helv"
 FONT_PATH     = "fonts/FreeSans.ttf"
 SRGB_ICC_PATH = "srgb.icc"
-
-DEBUG_OCR_LAYER         = False
-DEBUG_TEXT_POSITIONS    = False
-DEBUG_SAVE_INTERMEDIATE = False
 
 # ─────────────────────────── Logging ─────────────────────────────────────────
 logging.basicConfig(
@@ -81,21 +51,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
-# ─────────────────────────── Date helpers ────────────────────────────────────
+# ── Date helpers ──────────────────────────────────────────────────────────────
 def get_pdf_date_string(dt=None):
     if dt is None:
         dt = datetime.datetime.now()
     return dt.strftime("D:%Y%m%d%H%M%S")
-
 
 def get_xmp_date_string(dt=None):
     if dt is None:
         dt = datetime.datetime.now()
     return dt.strftime("%Y-%m-%dT%H:%M:%S")
 
-
-# ─────────────────────────── Font / ICC setup ────────────────────────────────
+# ─────────────────────────── Font and ICC Profile Setup ──────────────────────
 def setup_pdfa_resources():
     try:
         font_dir = Path("fonts")
@@ -110,38 +77,31 @@ def setup_pdfa_resources():
             )
         srgb_path = Path(SRGB_ICC_PATH)
         if not srgb_path.exists():
-            logger.info("Obtaining sRGB ICC profile...")
+            logger.info("Downloading sRGB ICC profile...")
             try:
                 import urllib.request
                 if platform.system() == "Darwin":
                     system_profile = "/System/Library/ColorSync/Profiles/sRGB Profile.icc"
-                    if Path(system_profile).exists():
-                        shutil.copy2(system_profile, str(srgb_path))
-                        return True
                 elif platform.system() == "Windows":
                     system_profile = os.path.join(
                         os.environ.get("WINDIR", "C:\\Windows"),
                         "System32", "spool", "drivers", "color",
                         "sRGB Color Space Profile.icm",
                     )
-                    if Path(system_profile).exists():
-                        shutil.copy2(system_profile, str(srgb_path))
-                        return True
                 elif platform.system() == "Linux":
                     system_profile = "/usr/share/color/icc/sRGB.icc"
-                    if Path(system_profile).exists():
-                        shutil.copy2(system_profile, str(srgb_path))
-                        return True
-                urllib.request.urlretrieve("https://www.color.org/srgb.xalter", str(srgb_path))
-                return True
+                else:
+                    system_profile = None
+                if system_profile and Path(system_profile).exists():
+                    shutil.copy2(system_profile, str(srgb_path))
+                else:
+                    urllib.request.urlretrieve("https://www.color.org/srgb.xalter", str(srgb_path))
             except Exception as e:
                 logger.warning(f"Could not obtain sRGB ICC profile: {e}")
-                return False
         return True
     except Exception as e:
         logger.error(f"Failed to setup PDF/A resources: {e}")
         return False
-
 
 # ─────────────────────────── XMP Metadata ────────────────────────────────────
 def create_xmp_metadata(title, author, subject, creator, producer, creation_date, modify_date):
@@ -168,7 +128,7 @@ def create_xmp_metadata(title, author, subject, creator, producer, creation_date
     </rdf:Description>
     <rdf:Description rdf:about="" xmlns:opt="http://github.com/Scholarly-Projects/opticolumn/">
       <opt:ToolName>Opticolumn</opt:ToolName>
-      <opt:Version>2026-Surya</opt:Version>
+      <opt:Version>2026</opt:Version>
     </rdf:Description>
   </rdf:RDF>
 </x:xmpmeta>
@@ -177,34 +137,18 @@ def create_xmp_metadata(title, author, subject, creator, producer, creation_date
         logger.error(f"Failed to create XMP metadata: {e}")
         return None
 
-
 # ─────────────────────────── Model Loading ───────────────────────────────────
 def load_models():
-    """
-    Load the Surya pipeline plus TrOCR.
-
-    Surya pipeline (this version):
-      FoundationPredictor – shared base model weights (1.34 GB); instantiated
-                            once and passed into LayoutPredictor to avoid
-                            loading the weights twice
-      DetectionPredictor  – individual text line bboxes (own weights)
-      LayoutPredictor     – column / region boundaries, driven by
-                            FoundationPredictor; used to derive reading order
-                            since OrderPredictor is not in this Surya build
-    """
     try:
         if not setup_pdfa_resources():
             logger.warning("PDF/A resources setup incomplete.")
 
+        logger.info("Loading Surya FoundationPredictor (shared base model)...")
+        foundation = FoundationPredictor()
+
         logger.info("Loading Surya DetectionPredictor (text line detection)...")
         detection_predictor = DetectionPredictor()
-
-        logger.info("Loading Surya FoundationPredictor (shared base model)...")
-        foundation_predictor = FoundationPredictor()
-
-        logger.info("Loading Surya LayoutPredictor (column / region detection)...")
-        layout_predictor = LayoutPredictor(foundation_predictor)
-
+     
         logger.info(f"Loading TrOCR model: {TROCR_MODEL_NAME}")
         processor   = TrOCRProcessor.from_pretrained(TROCR_MODEL_NAME)
         trocr_model = VisionEncoderDecoderModel.from_pretrained(TROCR_MODEL_NAME)
@@ -212,7 +156,7 @@ def load_models():
         trocr_model.to(device)
         logger.info(f"Using device: {device}")
 
-        return detection_predictor, layout_predictor, processor, trocr_model
+        return detection_predictor, processor, trocr_model
 
     except Exception as e:
         logger.error(f"Failed to load models: {e}")
@@ -220,25 +164,19 @@ def load_models():
         traceback.print_exc()
         raise
 
-
 try:
-    detection_predictor, layout_predictor, processor, trocr_model = load_models()
+    detection_predictor, processor, trocr_model = load_models()
 except Exception as e:
     logger.error("Model loading failed. Exiting.")
     sys.exit(1)
 
-
 # ─────────────────────────── Image Preprocessing ─────────────────────────────
 def preprocess_for_ocr(pil_image: Image.Image) -> Image.Image:
-    """
-    Return a preprocessed COPY of pil_image suitable for TrOCR.
-    The original is never modified and is NOT stored in the output PDF.
-    """
     if not ENABLE_PREPROCESSING:
         return pil_image.copy()
     try:
-        gray      = pil_image.convert("L")
-        gray      = ImageOps.autocontrast(gray, cutoff=2)
+        gray = pil_image.convert("L")
+        gray = ImageOps.autocontrast(gray, cutoff=2)
         processed = gray.convert("RGB")
         processed = processed.filter(ImageFilter.SHARPEN)
         return processed
@@ -246,18 +184,15 @@ def preprocess_for_ocr(pil_image: Image.Image) -> Image.Image:
         logger.error(f"Error preprocessing image for OCR: {e}")
         return pil_image.copy()
 
-
 def page_to_pil(page: fitz.Page, dpi: int = DPI) -> Image.Image:
-    """Render *page* at *dpi* and return an RGB PIL Image."""
     pix = page.get_pixmap(dpi=dpi)
     return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-
 
 # ─────────────────────────── TrOCR Recognition ───────────────────────────────
 def recognize_text_with_trocr(image: Image.Image, processor, model) -> tuple[str, float]:
     try:
         pixel_values = processor(image, return_tensors="pt").pixel_values
-        device       = next(model.parameters()).device
+        device = next(model.parameters()).device
         pixel_values = pixel_values.to(device)
         with torch.no_grad():
             out = model.generate(
@@ -276,7 +211,6 @@ def recognize_text_with_trocr(image: Image.Image, processor, model) -> tuple[str
     except Exception as e:
         logger.error(f"Error recognising text with TrOCR: {e}")
         return "", 0.0
-
 
 # ─────────────────────────── Noise Detection ─────────────────────────────────
 def is_likely_noise(text: str, confidence: float, seg_h: int, seg_w: int) -> bool:
@@ -303,255 +237,288 @@ def is_likely_noise(text: str, confidence: float, seg_h: int, seg_w: int) -> boo
         return True
     return False
 
-
-# ─────────────────────── Unified Surya Pipeline ──────────────────────────────
-def _bbox_from_box(box) -> List[float] | None:
-    """Extract [x0, y0, x1, y1] from a Surya box object regardless of format."""
+# ─────────────────────── Surya Segmentation + Reading Order ──────────────────
+def _bbox_from_surya_box(box) -> Optional[List[float]]:
     if hasattr(box, "bbox"):
-        return box.bbox
+        return list(box.bbox)
     if hasattr(box, "polygon") and len(box.polygon) >= 4:
-        poly = box.polygon
-        xs = [p[0] for p in poly]
-        ys = [p[1] for p in poly]
+        xs = [p[0] for p in box.polygon]
+        ys = [p[1] for p in box.polygon]
         return [min(xs), min(ys), max(xs), max(ys)]
     return None
 
-
-def _iou_x_overlap(line_bbox: List[float], region_bbox: List[float]) -> float:
-    """
-    Return the fraction of the line's horizontal span that overlaps the region.
-    Used to assign a text line to the column it mostly falls inside.
-    """
-    lx0, lx1 = line_bbox[0], line_bbox[2]
-    rx0, rx1 = region_bbox[0], region_bbox[2]
-    overlap  = max(0.0, min(lx1, rx1) - max(lx0, rx0))
-    line_w   = max(lx1 - lx0, 1)
-    return overlap / line_w
-
-
-def get_ordered_text_lines(
-    image: Image.Image,
-    detection_predictor: DetectionPredictor,
-    layout_predictor: LayoutPredictor,
-) -> List[Dict[str, Any]]:
-    """
-    Layout-region-aware reading order without OrderPredictor.
-
-    Strategy
-    ────────
-    Because this Surya build does not ship surya.ordering, reading order is
-    derived directly from LayoutPredictor's column/region bboxes:
-
-    1. LayoutPredictor returns bboxes for each detected region (columns,
-       headers, captions, figures, etc.).  These bboxes define where columns
-       begin and end, so their left edges give us a reliable column index even
-       when gutters are only a few pixels wide (e.g. the 1916 7-column paper).
-
-    2. DetectionPredictor returns individual text line bboxes.
-
-    3. Each text line is assigned to the layout region whose horizontal span
-       it overlaps the most (x-overlap fraction).  Lines that don't overlap
-       any region get their own synthetic single-line region so nothing is lost.
-
-    4. Regions are sorted left-to-right by their x0 coordinate.  Within each
-       region, lines are sorted top-to-bottom by their y0 coordinate.
-
-    This produces correct column-by-column reading order for any number of
-    columns without any hard-coded pixel tolerances.  The LayoutPredictor
-    transformer handles gutter-width variation implicitly.
-
-    Fallback
-    ────────
-    If LayoutPredictor returns no regions, the function falls back to a
-    gentle row-bucket sort (tolerance = 15 px) which is still better than
-    the old 20 px tolerance because the bucket size is smaller and the
-    function never crashes.
-    """
+def get_surya_lines(image: Image.Image) -> List[List[float]]:
     try:
-        # ── Step 1: Layout regions ────────────────────────────────────────────
-        layout_results = layout_predictor([image])
-        layout_page    = layout_results[0] if layout_results else None
-
-        regions: List[List[float]] = []
-        if layout_page is not None and hasattr(layout_page, "bboxes"):
-            for box in layout_page.bboxes:
-                bbox = _bbox_from_box(box)
-                if bbox is not None:
-                    regions.append(bbox)
-
-        logger.debug(f"LayoutPredictor found {len(regions)} regions.")
-
-        # ── Step 2: Text line detection ───────────────────────────────────────
-        detection_results = detection_predictor([image])
-        if not detection_results or not hasattr(detection_results[0], "bboxes"):
-            logger.warning("DetectionPredictor returned no results.")
+        results = detection_predictor([image])
+        if not results or not hasattr(results[0], "bboxes"):
             return []
-
-        det_page = detection_results[0]
-        if not det_page.bboxes:
-            logger.warning("DetectionPredictor found zero text lines.")
-            return []
-
-        raw_lines: List[Dict[str, Any]] = []
-        for i, box in enumerate(det_page.bboxes):
-            bbox = _bbox_from_box(box)
-            if bbox is None:
-                continue
-            raw_lines.append({
-                "bbox":       bbox,
-                "confidence": getattr(box, "confidence", 1.0),
-                "position":   i,
-            })
-
-        if not raw_lines:
-            return []
-
-        # ── Step 3: Assign lines to regions ──────────────────────────────────
-        if regions:
-            # Sort regions left-to-right so the region index IS the column index
-            regions_sorted = sorted(regions, key=lambda r: r[0])
-
-            # Build buckets: one list of lines per region
-            buckets: List[List[Dict]] = [[] for _ in regions_sorted]
-            unassigned: List[Dict]    = []
-
-            for line in raw_lines:
-                best_region_idx = -1
-                best_overlap    = 0.05   # minimum 5% x-overlap to count
-                for ri, region in enumerate(regions_sorted):
-                    overlap = _iou_x_overlap(line["bbox"], region)
-                    if overlap > best_overlap:
-                        best_overlap    = overlap
-                        best_region_idx = ri
-                if best_region_idx >= 0:
-                    buckets[best_region_idx].append(line)
-                else:
-                    unassigned.append(line)
-
-            # Within each bucket sort top-to-bottom
-            ordered: List[Dict] = []
-            for bucket in buckets:
-                ordered.extend(sorted(bucket, key=lambda l: l["bbox"][1]))
-
-            # Unassigned lines go last, sorted by position
-            ordered.extend(sorted(unassigned, key=lambda l: l["bbox"][1]))
-
-            logger.info(
-                f"Layout-region sort: {len(ordered)} lines across "
-                f"{len(regions_sorted)} regions "
-                f"({len(unassigned)} unassigned)."
-            )
-            return ordered
-
-        else:
-            # ── Fallback: no layout regions — row-bucket sort ─────────────────
-            logger.warning(
-                "No layout regions found; using row-bucket sort (tolerance=15 px)."
-            )
-            tolerance = 15
-            raw_lines.sort(key=lambda l: (l["bbox"][1] // tolerance * tolerance, l["bbox"][0]))
-            return raw_lines
-
+        bboxes = []
+        for box in results[0].bboxes:
+            bbox = _bbox_from_surya_box(box)
+            if bbox is not None:
+                bboxes.append(bbox)
+        return bboxes
     except Exception as e:
-        logger.error(f"Error in get_ordered_text_lines: {e}")
+        logger.error(f"Surya DetectionPredictor failed: {e}")
         import traceback
         traceback.print_exc()
         return []
 
+def _detect_column_gutters(line_bboxes: List[List[float]], page_width: float) -> List[float]:
+    if not line_bboxes:
+        return []
 
-# ─────────────────────────── OCR Extraction ──────────────────────────────────
+    MAX_LINE_WIDTH_FRAC = 0.28  
+    MIN_GAP_WIDTH_PX    = 10     
+    MIN_GUTTER_MERGE_PX = 20     
+    RESOLUTION          = 4      
+
+    max_w  = page_width * MAX_LINE_WIDTH_FRAC
+    narrow = [b for b in line_bboxes if (b[2] - b[0]) <= max_w]
+    if not narrow:
+        logger.warning("No narrow lines for gutter detection; using all lines.")
+        narrow = line_bboxes
+
+    logger.info(
+        f"Gutter histogram: {len(narrow)}/{len(line_bboxes)} lines used "
+        f"(width ≤ {max_w:.0f}px = {MAX_LINE_WIDTH_FRAC*100:.0f}% of {page_width:.0f}px)."
+    )
+
+    hist_w = int(page_width / RESOLUTION) + 2
+    hist   = [0] * hist_w
+    for x0, y0, x1, y1 in narrow:
+        bi = int(((x0 + x1) / 2.0) / RESOLUTION)
+        if 0 <= bi < hist_w:
+            hist[bi] += 1
+
+    occupied = sum(1 for v in hist if v > 0)
+    logger.info(
+        f"Centre-point histogram: max={max(hist)}  "
+        f"occupied={occupied}/{hist_w} buckets."
+    )
+
+    NEAR_ZERO = 1
+    gaps: List[float] = []
+    in_gap = False
+    gap_start = 0
+
+    for i, v in enumerate(hist):
+        if v <= NEAR_ZERO:
+            if not in_gap:
+                in_gap = True
+                gap_start = i
+        else:
+            if in_gap:
+                gap_w_px = (i - gap_start) * RESOLUTION
+                if gap_w_px >= MIN_GAP_WIDTH_PX:
+                    gaps.append(((gap_start + i - 1) / 2.0) * RESOLUTION)
+                in_gap = False
+  
+    if in_gap:
+        gap_w_px = (hist_w - gap_start) * RESOLUTION
+        if gap_w_px >= MIN_GAP_WIDTH_PX:
+            gaps.append(((gap_start + hist_w - 1) / 2.0) * RESOLUTION)
+
+    logger.info(f"Zero-vote gaps: {len(gaps)} candidates before merging.")
+
+    merged: List[float] = []
+    for g in sorted(gaps):
+        if merged and g - merged[-1] < MIN_GUTTER_MERGE_PX:
+            merged[-1] = (merged[-1] + g) / 2.0
+        else:
+            merged.append(g)
+
+    margin = page_width * 0.03   
+    merged = [g for g in merged if margin < g < page_width - margin]
+
+    logger.info(
+        f"Column gutters: {len(merged)} → {[round(g) for g in merged]}"
+        f"  ({len(merged)+1} column(s))"
+    )
+    if not merged:
+        logger.warning(
+            f"No gutters found. Occupied histogram buckets={occupied}/{hist_w}. "
+            f"If page is genuinely single-column this is correct. "
+            f"Otherwise try raising MAX_LINE_WIDTH_FRAC above {MAX_LINE_WIDTH_FRAC}."
+        )
+    return merged
+
+
+# CHANGED: Now outputs List[List[List[float]]] -> List of Segments
+def order_lines_surya(line_bboxes: List[List[float]], image: Image.Image) -> List[List[List[float]]]:
+    if not line_bboxes:
+        return []
+
+    try:
+        page_width = float(image.width)
+        page_height = float(image.height)
+        gutters    = _detect_column_gutters(line_bboxes, page_width)
+
+        if not gutters:
+            logger.warning(
+                "No column gutters detected — all lines will be sorted "
+                "top-to-bottom as a single segment.  If the page has multiple "
+                "columns, check the gutter detection log above."
+            )
+            return [[sorted(line_bboxes, key=lambda b: b[1])]]
+
+        n_cols    = len(gutters) + 1
+        col_edges = [0.0] + gutters + [page_width]
+        intervals = [(col_edges[i], col_edges[i + 1]) for i in range(n_cols)]
+     
+        wide_lines: List[List[float]] = []
+        narrow_lines: List[List[float]] = []
+
+        MAX_LINE_WIDTH_FRAC = 0.40
+
+        for bbox in line_bboxes:
+            x0, y0, x1, y1 = bbox
+            line_w = x1 - x0
+            if line_w > page_width * MAX_LINE_WIDTH_FRAC:
+                wide_lines.append(bbox)
+            else:
+                narrow_lines.append(bbox)
+
+        # Sort wide lines by Y coordinate to establish horizontal page bands
+        wide_lines.sort(key=lambda b: b[1])
+        
+        band_edges = [0.0]
+        for wl in wide_lines:
+            band_edges.append(wl[1])
+        band_edges.append(page_height + 9999.0)
+
+        segments: List[List[List[float]]] = []
+
+        # Form reading blocks grouped by horizontal band -> column
+        for i in range(len(band_edges) - 1):
+            band_top = band_edges[i]
+            band_bottom = band_edges[i+1]
+
+            band_lines = [
+                b for b in narrow_lines
+                if band_top <= ((b[1] + b[3]) / 2.0) < band_bottom
+            ]
+
+            cols = [[] for _ in range(n_cols)]
+            for b in band_lines:
+                cx = (b[0] + b[2]) / 2.0
+                col_i = n_cols - 1 
+                for ci, (lo, hi) in enumerate(intervals):
+                    if lo <= cx < hi:
+                        col_i = ci
+                        break
+                cols[col_i].append(b)
+
+            # A segment is the collection of lines moving vertically down a column
+            for col in cols:
+                if col:
+                    col.sort(key=lambda b: b[1])
+                    segments.append(col)
+
+            # Insert the wide headline separating the horizontal bands
+            if i < len(wide_lines):
+                segments.append([wide_lines[i]])
+
+        logger.info(
+            f"order_lines_surya: {len(line_bboxes)} lines → "
+            f"{n_cols} column(s), {len(wide_lines)} wide line(s) interleaved into "
+            f"{len(segments)} discrete structural segments."
+        )
+        return segments
+
+    except Exception as e:
+        logger.error(f"order_lines_surya failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return [[sorted(line_bboxes, key=lambda b: b[1])]]
+
+# ─────────────────────────── OCR Text Element Extraction ─────────────────────
+# CHANGED: Now builds multi-level list ensuring Segments persist
 def create_ocr_text_elements(
     pil_images: List[Image.Image],
     filename: str,
-) -> List[List[dict]]:
-    """
-    Run the Surya pipeline + TrOCR on each PIL image.
-    Returns per-page lists of dicts with pixel-space coordinates.
-    Keys: x0, y_baseline, font_size, text
-    """
+) -> List[List[List[dict]]]:
+    
     font_path = Path(FONT_PATH)
     if not font_path.exists():
         raise FileNotFoundError(f"Required font {font_path} is missing.")
 
-    all_pages: List[List[dict]] = []
+    all_pages: List[List[List[dict]]] = []
     total_elements = 0
 
     for idx, pil_image in enumerate(pil_images):
         page_num = idx + 1
         logger.info(f"Processing page {page_num}/{len(pil_images)} of {filename}")
-        page_elements: List[dict] = []
+        page_segments: List[List[dict]] = []
         filtered = 0
+        page_elements_count = 0
 
         try:
-            ocr_image = preprocess_for_ocr(pil_image)   # OCR copy — preprocessed
+            raw_bboxes = get_surya_lines(pil_image)     
+            logger.info(f"Found {len(raw_bboxes)} text lines on page {page_num}")
 
-            # Full Surya pipeline: layout regions → detection → column-aware order
-            sorted_lines = get_ordered_text_lines(
-                ocr_image,
-                detection_predictor,
-                layout_predictor,
-            )
-            logger.info(f"Found {len(sorted_lines)} ordered text lines on page {page_num}.")
-
-            if not sorted_lines:
+            if not raw_bboxes:
                 logger.warning("No text lines detected. Saving debug image...")
                 debug_dir = Path("debug_images")
                 debug_dir.mkdir(exist_ok=True)
-                ocr_image.save(debug_dir / f"{filename}_page{page_num}_preprocessed.png")
+                pil_image.save(debug_dir / f"{filename}_page{page_num}_original.png")
 
-            for i, line in enumerate(sorted_lines):
-                try:
-                    bbox        = line["bbox"]
-                    x0, y0, x1, y1 = bbox[0], bbox[1], bbox[2], bbox[3]
-                    sh, sw      = y1 - y0, x1 - x0
+            sorted_segments = order_lines_surya(raw_bboxes, pil_image)
+            ocr_image = preprocess_for_ocr(pil_image)
 
-                    if sh < 5 or sw < 5:
-                        filtered += 1
-                        continue
+            for seg_idx, segment_bboxes in enumerate(sorted_segments):
+                segment_elements: List[dict] = []
+                for i, bbox in enumerate(segment_bboxes):
+                    try:
+                        x0, y0, x1, y1 = bbox[0], bbox[1], bbox[2], bbox[3]
+                        sh, sw = y1 - y0, x1 - x0
 
-                    # Crop from the OCR copy (same pixel space)
-                    line_img            = ocr_image.crop((x0, y0, x1, y1))
-                    text, confidence    = recognize_text_with_trocr(
-                        line_img, processor, trocr_model
-                    )
+                        if sh < 5 or sw < 5:
+                            filtered += 1
+                            continue
 
-                    if is_likely_noise(text, confidence, sh, sw):
-                        filtered += 1
-                        continue
+                        line_img = ocr_image.crop((x0, y0, x1, y1))
+                        text, confidence = recognize_text_with_trocr(
+                            line_img, processor, trocr_model
+                        )
 
-                    page_elements.append({
-                        "x0":         x0,
-                        "y_baseline": y1,
-                        "font_size":  max(6, min(sh * 0.9, 72)),
-                        "text":       text,
-                    })
+                        if is_likely_noise(text, confidence, sh, sw):
+                            filtered += 1
+                            continue
 
-                except Exception as e:
-                    logger.error(f"Error on text line {i + 1}: {e}")
+                        segment_elements.append({
+                            "x0":         x0,
+                            "y_baseline": y1,
+                            "font_size":  max(6, min(sh * 0.9, 72)),
+                            "text":       text,
+                        })
 
-            logger.info(
-                f"Page {page_num}: {len(page_elements)} elements accepted, "
-                f"{filtered} filtered."
-            )
-            total_elements += len(page_elements)
+                    except Exception as e:
+                        logger.error(f"Error on text line {i + 1}: {e}")
+                
+                if segment_elements:
+                    page_segments.append(segment_elements)
+                    page_elements_count += len(segment_elements)
+
+            logger.info(f"Page {page_num}: {page_elements_count} elements in {len(page_segments)} segments, {filtered} filtered.")
+            total_elements += page_elements_count
 
         except Exception as e:
             logger.error(f"OCR failed for page {page_num}: {e}")
             import traceback
             traceback.print_exc()
 
-        all_pages.append(page_elements)
+        all_pages.append(page_segments)
 
     logger.info(
         f"OCR extraction complete: {total_elements} total text elements "
-        f"across {len(pil_images)} pages."
+        f"across {len(pil_images)} pages"
     )
     return all_pages
 
 
 # ─────────────────────────── PDF/A Compliance ────────────────────────────────
 def setup_pdfa_compliance(pdf_path: str):
-    """Embed sRGB OutputIntent into an already-saved PDF using pikepdf."""
     try:
         srgb_path = Path(SRGB_ICC_PATH)
         if not srgb_path.exists():
@@ -579,13 +546,8 @@ def setup_pdfa_compliance(pdf_path: str):
     except Exception as e:
         logger.error(f"Failed to set up PDF/A compliance: {e}")
 
-
-# ─────────────────────────── PDF OCR Processing ──────────────────────────────
+# ─────────────────────────── PDF Processing (OCR) ────────────────────────────
 def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
-    """
-    Add an invisible OCR text layer to *input_path* and write the result
-    to *output_path*.
-    """
     filename = os.path.basename(input_path)
     logger.info(f"Starting OCR for: {filename}")
 
@@ -604,7 +566,7 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
                 "title":        filename,
                 "author":       "Opticolumn",
                 "subject":      "OCR processed document",
-                "creator":      "Opticolumn 2026-Surya",
+                "creator":      "Opticolumn 2026",
                 "producer":     "PyMuPDF",
                 "creationDate": creation_date,
                 "modDate":      creation_date,
@@ -613,7 +575,7 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
                 title=filename,
                 author="Opticolumn",
                 subject="OCR processed document",
-                creator="Opticolumn 2026-Surya",
+                creator="Opticolumn 2026",
                 producer="PyMuPDF",
                 creation_date=get_xmp_date_string(now),
                 modify_date=get_xmp_date_string(now),
@@ -626,7 +588,7 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
 
             for page_num in range(page_count):
                 page     = doc[page_num]
-                elements = ocr_pages[page_num]
+                segments = ocr_pages[page_num]
                 pil_img  = pil_images[page_num]
 
                 existing_text = page.get_text().strip()
@@ -649,24 +611,41 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
                     f"{page_w:.1f}×{page_h:.1f}pt  (sx={sx:.4f}, sy={sy:.4f})"
                 )
 
-                inserted = 0
-                for elem in elements:
-                    try:
-                        page.insert_text(
-                            fitz.Point(elem["x0"] * sx, elem["y_baseline"] * sy),
-                            elem["text"],
-                            fontsize=max(4, elem["font_size"] * sy),
-                            fontname=FONT_NAME,
-                            render_mode=3,
-                            color=(0, 0, 0),
+                # CHANGED: Isolate each segment into its own logical block (Form XObject)
+                # to prevent PDF viewers from bridging text selection across columns horizontally
+                total_inserted = 0
+                for seg_idx, segment in enumerate(segments):
+                    seg_doc = fitz.open()
+                    seg_page = seg_doc.new_page(width=page_w, height=page_h)
+                    inserted = 0
+                    
+                    for elem in segment:
+                        try:
+                            seg_page.insert_text(
+                                fitz.Point(elem["x0"] * sx, elem["y_baseline"] * sy),
+                                elem["text"],
+                                fontsize=max(4, elem["font_size"] * sy),
+                                fontname=FONT_NAME,
+                                render_mode=3,       
+                                color=(0, 0, 0),
+                            )
+                            inserted += 1
+                        except Exception as e:
+                            logger.error(f"Failed to insert text on page {page_num+1}: {e}")
+                    
+                    if inserted > 0:
+                        page.show_pdf_page(
+                            page.rect,
+                            seg_doc,
+                            0,
+                            keep_proportion=True,
+                            overlay=True
                         )
-                        inserted += 1
-                    except Exception as e:
-                        logger.error(f"Failed to insert text on page {page_num+1}: {e}")
+                        total_inserted += inserted
+                        
+                    seg_doc.close()
 
-                logger.info(
-                    f"Page {page_num+1}: inserted {inserted}/{len(elements)} text elements."
-                )
+                logger.info(f"Page {page_num+1}: inserted {total_inserted} elements across {len(segments)} segment containers")
 
             doc.save(
                 output_path,
@@ -694,9 +673,7 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
                     total_chars += chars
                     logger.info(f"Final PDF page {i+1} extractable text length: {chars}")
                 if total_chars > 0:
-                    logger.info(
-                        f"SUCCESS: Final PDF contains {total_chars} characters of searchable text."
-                    )
+                    logger.info(f"SUCCESS: Final PDF contains {total_chars} characters of searchable text")
                 else:
                     logger.error("PROBLEM: Final PDF has no extractable text!")
         except Exception as e:
@@ -710,19 +687,15 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
         traceback.print_exc()
         return False
 
-
 # ─────────────────────────── Compression ─────────────────────────────────────
 def compress_to_target_size(input_pdf: Path, output_pdf: Path, original_size: int) -> Path:
-    """
-    Try to keep the output within 15% of the original size using
-    PDF-native deflate compression only.
-    """
-    max_target    = int(original_size * 1.15)
-    current_size  = input_pdf.stat().st_size
+    max_target = int(original_size * 1.15)
     logger.info(
         f"Targeting maximum size: {max_target // 1024} KB "
         f"(15% increase from original {original_size // 1024} KB)"
     )
+
+    current_size = input_pdf.stat().st_size
     logger.info(f"OCR file size before compression: {current_size // 1024} KB")
 
     if current_size <= max_target:
@@ -744,10 +717,7 @@ def compress_to_target_size(input_pdf: Path, output_pdf: Path, original_size: in
 
             compressed_size = temp_out.stat().st_size
             pct = (compressed_size - original_size) / original_size * 100
-            logger.info(
-                f"Compression option {i+1}: {compressed_size // 1024} KB "
-                f"({pct:+.1f}% from original)"
-            )
+            logger.info(f"Compression option {i+1}: {compressed_size // 1024} KB ({pct:+.1f}% from original)")
 
             if compressed_size <= max_target:
                 try:
@@ -758,16 +728,10 @@ def compress_to_target_size(input_pdf: Path, output_pdf: Path, original_size: in
 
                 if total_chars > 0:
                     shutil.move(str(temp_out), str(output_pdf))
-                    logger.info(
-                        f"Compression option {i+1} accepted; "
-                        f"OCR preserved ({total_chars} chars)."
-                    )
+                    logger.info(f"Compression option {i+1} accepted; OCR preserved ({total_chars} chars).")
                     return output_pdf
                 else:
-                    logger.error(
-                        "OCR lost after compression attempt — "
-                        "falling back to uncompressed OCR file."
-                    )
+                    logger.error("OCR lost after compression attempt — falling back to uncompressed OCR file.")
                     temp_out.unlink(missing_ok=True)
                     shutil.copy2(input_pdf, output_pdf)
                     return output_pdf
@@ -785,7 +749,6 @@ def compress_to_target_size(input_pdf: Path, output_pdf: Path, original_size: in
     shutil.copy2(input_pdf, output_pdf)
     return output_pdf
 
-
 # ─────────────────────────── Main ────────────────────────────────────────────
 def main():
     input_folder  = Path(INPUT_DIR)
@@ -802,10 +765,10 @@ def main():
         sys.exit(1)
 
     logger.info(f"Processing {len(pdf_files)} files with TrOCR: {TROCR_MODEL_NAME}")
-    logger.info("Layout detection:  Surya LayoutPredictor (column region boundaries)")
-    logger.info("Line detection:    Surya DetectionPredictor")
-    logger.info("Reading order:     Layout-region column sort (OrderPredictor not in this Surya build)")
-    logger.info("Target:            Final size ≤ original + 15% (OCR text layer only; images untouched)")
+    logger.info("Segmentation:  Surya DetectionPredictor")
+    logger.info("Reading order: histogram column-gap detection (geometric, no fixed tolerances)")
+    logger.info("Recognition:   TrOCR (unchanged)")
+    logger.info("Target: Final size ≤ original + 15% (OCR text layer only; images untouched)")
 
     for pdf_path in pdf_files:
         original_size = pdf_path.stat().st_size
@@ -837,7 +800,6 @@ def main():
             logger.warning(f"Could not delete temp file: {e}")
 
     logger.info(f"\nAll done! Output files in '{OUTPUT_DIR}/'")
-
 
 if __name__ == "__main__":
     main()
