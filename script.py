@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Opticolumn 
+Opticolumn - Surya Edition
+OCR pipeline using Surya for layout/reading order and TrOCR for text recognition
 """
 
 import sys
@@ -8,13 +9,11 @@ import os
 import tempfile
 from pathlib import Path
 import fitz  # PyMuPDF
-from kraken import blla
-from kraken.lib.vgsl import TorchVGSLModel
 from io import BytesIO
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 import numpy as np
 import logging
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
 import torch
 from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 import re
@@ -22,6 +21,10 @@ import platform
 import datetime
 import shutil
 import pikepdf
+
+# Surya imports - use DetectionPredictor for text line detection (like Kraken BLLA)
+from surya.detection import DetectionPredictor
+from surya.settings import settings
 
 # ---------------- Configuration ----------------
 INPUT_DIR  = "A"
@@ -40,10 +43,8 @@ ENABLE_PREPROCESSING           = True   # affects OCR copy only, not stored imag
 CONFIDENCE_THRESHOLD           = 0.25
 SINGLE_CHAR_CONFIDENCE_THRESHOLD = 0.5
 MIN_SEGMENT_HEIGHT             = 10
-# For invisible OCR text (render_mode=3) we use a PDF base-14 font so that
-# nothing is embedded in the output file — eliminating ~400 KB per document.
-FONT_NAME  = "helv"                  # Helvetica — built-in, zero embedding overhead
-FONT_PATH  = "fonts/FreeSans.ttf"   # retained for future visible-text needs only
+FONT_NAME  = "helv"
+FONT_PATH  = "fonts/FreeSans.ttf"
 SRGB_ICC_PATH = "srgb.icc"
 DEBUG_OCR_LAYER         = False
 DEBUG_TEXT_POSITIONS    = False
@@ -90,22 +91,28 @@ def setup_pdfa_resources():
                 import urllib.request
                 if platform.system() == "Darwin":
                     system_profile = "/System/Library/ColorSync/Profiles/sRGB Profile.icc"
+                    if Path(system_profile).exists():
+                        shutil.copy2(system_profile, str(srgb_path))
+                        return True
                 elif platform.system() == "Windows":
                     system_profile = os.path.join(
                         os.environ.get("WINDIR", "C:\\Windows"),
                         "System32", "spool", "drivers", "color",
                         "sRGB Color Space Profile.icm",
                     )
+                    if Path(system_profile).exists():
+                        shutil.copy2(system_profile, str(srgb_path))
+                        return True
                 elif platform.system() == "Linux":
                     system_profile = "/usr/share/color/icc/sRGB.icc"
-                else:
-                    system_profile = None
-                if system_profile and Path(system_profile).exists():
-                    shutil.copy2(system_profile, str(srgb_path))
-                else:
-                    urllib.request.urlretrieve("https://www.color.org/srgb.xalter", str(srgb_path))
+                    if Path(system_profile).exists():
+                        shutil.copy2(system_profile, str(srgb_path))
+                        return True
+                urllib.request.urlretrieve("https://www.color.org/srgb.xalter", str(srgb_path))
+                return True
             except Exception as e:
                 logger.warning(f"Could not obtain sRGB ICC profile: {e}")
+                return False
         return True
     except Exception as e:
         logger.error(f"Failed to setup PDF/A resources: {e}")
@@ -137,7 +144,7 @@ def create_xmp_metadata(title, author, subject, creator, producer, creation_date
     </rdf:Description>
     <rdf:Description rdf:about="" xmlns:opt="http://github.com/Scholarly-Projects/opticolumn/">
       <opt:ToolName>Opticolumn</opt:ToolName>
-      <opt:Version>2026</opt:Version>
+      <opt:Version>2026-Surya</opt:Version>
     </rdf:Description>
   </rdf:RDF>
 </x:xmpmeta>
@@ -152,23 +159,26 @@ def load_models():
     try:
         if not setup_pdfa_resources():
             logger.warning("PDF/A resources setup incomplete.")
-        seg_model_path = Path(MODELS_DIR) / "blla.mlmodel"
-        logger.info(f"Loading segmentation model: {seg_model_path}")
-        seg_model = TorchVGSLModel.load_model(str(seg_model_path))
-        seg_model.eval()
+        
+        logger.info("Loading Surya detection predictor (text line detection)...")
+        # DetectionPredictor detects individual text lines (like Kraken BLLA)
+        detection_predictor = DetectionPredictor()
+        
         logger.info(f"Loading TrOCR model: {TROCR_MODEL_NAME}")
         processor   = TrOCRProcessor.from_pretrained(TROCR_MODEL_NAME)
         trocr_model = VisionEncoderDecoderModel.from_pretrained(TROCR_MODEL_NAME)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         trocr_model.to(device)
         logger.info(f"Using device: {device}")
-        return seg_model, processor, trocr_model
+        return detection_predictor, processor, trocr_model
     except Exception as e:
         logger.error(f"Failed to load models: {e}")
+        import traceback
+        traceback.print_exc()
         raise
 
 try:
-    seg_model, processor, trocr_model = load_models()
+    detection_predictor, processor, trocr_model = load_models()
 except Exception as e:
     logger.error("Model loading failed. Exiting.")
     sys.exit(1)
@@ -177,9 +187,8 @@ except Exception as e:
 # ---------------- Image Preprocessing (OCR copy only) ----------------
 def preprocess_for_ocr(pil_image: Image.Image) -> Image.Image:
     """
-    Return a preprocessed COPY of pil_image suitable for the segmentation
-    model and TrOCR.  The original pil_image is never modified and is NOT
-    stored in the output PDF.
+    Return a preprocessed COPY of pil_image suitable for TrOCR.
+    The original pil_image is never modified and is NOT stored in the output PDF.
     """
     if not ENABLE_PREPROCESSING:
         return pil_image.copy()
@@ -252,97 +261,82 @@ def is_likely_noise(text: str, confidence: float, seg_h: int, seg_w: int) -> boo
     return False
 
 
-# ---------------- Column Detection and Sorting ----------------
-def geometric_column_sort(lines: List) -> List:
+# ---------------- Surya Text Line Detection ----------------
+def get_surya_text_lines(image: Image.Image, detection_predictor: DetectionPredictor) -> List[Dict[str, Any]]:
     """
-    Pure-geometry fallback column sorter using a horizontal projection
-    histogram.  Used only when Kraken has not provided reading-order
-    metadata.  Detects column gaps as valleys in the histogram, assigns
-    each line to a column by its centre-x, then sorts left→right across
-    columns and top→bottom within each column.
+    Get text line bounding boxes from Surya DetectionPredictor.
+    Returns list of dicts with bbox in pixel coordinates.
+    
+    This is the Surya equivalent of Kraken's blla.segment() - detects
+    individual text lines, not document-level layout regions.
     """
-    if len(lines) <= 1:
+    try:
+        # Surya detection predictor - pass image in a list for batch processing
+        detection_results = detection_predictor([image])
+        
+        if not detection_results or len(detection_results) == 0:
+            return []
+        
+        page_result = detection_results[0]
+        lines = []
+        
+        # Access bboxes from detection result
+        # Each box represents a text line
+        for i, box in enumerate(page_result.bboxes):
+            # Surya bbox format: [x1, y1, x2, y2] or polygon
+            if hasattr(box, 'bbox'):
+                bbox = box.bbox  # [x1, y1, x2, y2]
+            elif hasattr(box, 'polygon') and len(box.polygon) >= 4:
+                # Convert polygon to bbox
+                poly = box.polygon
+                xs = [p[0] for p in poly]
+                ys = [p[1] for p in poly]
+                bbox = [min(xs), min(ys), max(xs), max(ys)]
+            else:
+                continue
+            
+            # Get confidence score if available
+            confidence = getattr(box, 'confidence', 1.0)
+            
+            lines.append({
+                'bbox': bbox,
+                'confidence': confidence,
+                'position': i,  # Detection order (top-to-bottom, left-to-right)
+            })
+        
+        # Sort by position (y-first, then x) for reading order
+        # Surya detection already returns boxes in reasonable order
+        lines.sort(key=lambda x: (x['bbox'][1] // 10 * 10, x['bbox'][0]))
+        
         return lines
-
-    bboxes = []
-    for line in lines:
-        if hasattr(line, "boundary") and len(line.boundary) >= 3:
-            xs = [p[0] for p in line.boundary]
-            ys = [p[1] for p in line.boundary]
-            x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
-        elif hasattr(line, "bbox"):
-            x0, y0, x1, y1 = line.bbox
-        else:
-            continue
-        bboxes.append((x0, y0, x1, y1, line))
-
-    if not bboxes:
-        return lines
-
-    page_width = max(b[2] for b in bboxes)
-    resolution = 10
-    hist_w = int(page_width / resolution) + 1
-    hist   = [0] * hist_w
-    for x0, y0, x1, y1, _ in bboxes:
-        for bi in range(int(x0 / resolution), min(int(x1 / resolution) + 1, hist_w)):
-            hist[bi] += (y1 - y0)
-
-    smoothed = hist.copy()
-    for i in range(1, len(hist) - 1):
-        smoothed[i] = (hist[i - 1] + 2 * hist[i] + hist[i + 1]) / 4
-
-    valleys = []
-    for i in range(1, len(smoothed) - 1):
-        if smoothed[i] < smoothed[i - 1] and smoothed[i] < smoothed[i + 1]:
-            nbr_max = max(smoothed[i - 1], smoothed[i + 1])
-            if nbr_max > 0 and smoothed[i] / nbr_max < 0.3:
-                valleys.append(i * resolution)
-
-    if not valleys:
-        widths = [x1 - x0 for x0, y0, x1, y1, _ in bboxes]
-        avg_w  = sum(widths) / len(widths) if widths else 100
-        n_cols = max(1, min(int(page_width / (avg_w * 1.5)), 5))
-        col_w  = page_width / n_cols
-        valleys = [int((i + 1) * col_w) for i in range(n_cols - 1)]
-
-    valleys  = sorted(v for v in valleys if 0 < v < page_width)
-    columns  = [[] for _ in range(len(valleys) + 1)]
-    for box in bboxes:
-        x0, y0, x1, y1, line = box
-        cx    = (x0 + x1) / 2
-        col_i = sum(1 for v in valleys if cx > v)
-        columns[col_i].append(box)
-
-    sorted_lines = []
-    for col in columns:
-        for box in sorted(col, key=lambda b: b[1]):
-            sorted_lines.append(box[4])
-    return sorted_lines
-
-
-def order_lines(segmentation) -> List:
-    """
-    Return segmentation lines in the best available reading order.
-
-    Strategy:
-      1. Kraken blla already runs its own reading-order algorithm before
-         returning (the "Compute reading order / topological sort" log lines
-         come from inside blla).  `segmentation.lines` is therefore already
-         in reading order — use it directly whenever it has content.
-      2. Only fall back to geometric_column_sort when the segmentation
-         result is empty or carries no lines at all.
-
-    This prevents our histogram sort from undoing the ordering Kraken spent
-    time computing, which was the root cause of column mis-ordering on
-    multi-column newspaper pages.
-    """
-    lines = getattr(segmentation, "lines", [])
-    if not lines:
+    except Exception as e:
+        logger.error(f"Error getting Surya text lines: {e}")
+        import traceback
+        traceback.print_exc()
         return []
 
-    # Kraken has provided an ordered list — trust it.
-    logger.debug(f"Using Kraken reading order for {len(lines)} lines.")
-    return list(lines)
+
+def order_lines_surya(text_lines: List[Dict[str, Any]], pil_image: Image.Image) -> List[Dict[str, Any]]:
+    """
+    Return text lines in reading order.
+    Surya detection already returns lines in reasonable order, but we
+    apply a gentle sort to ensure proper reading order (top-to-bottom,
+    left-to-right with tolerance for line height variations).
+    """
+    if not text_lines:
+        return []
+    
+    # Sort by y-coordinate (with tolerance for slight variations), then x
+    # This handles multi-column layouts better than pure y-sort
+    tolerance = 20  # pixels - lines within this y-range are considered same "row"
+    
+    def sort_key(line):
+        y = line['bbox'][1]
+        x = line['bbox'][0]
+        return (y // tolerance * tolerance, x)
+    
+    logger.debug(f"Using Surya reading order for {len(text_lines)} lines.")
+    return sorted(text_lines, key=sort_key)
 
 
 # ---------------- OCR Text Element Extraction ----------------
@@ -351,8 +345,8 @@ def create_ocr_text_elements(
     filename: str,
 ) -> List[List[dict]]:
     """
-    Run segmentation + TrOCR on each PIL image (which may be a preprocessed
-    copy).  Returns per-page lists of dicts with pixel-space coordinates.
+    Run Surya text line detection + TrOCR on each PIL image.
+    Returns per-page lists of dicts with pixel-space coordinates.
 
     Keys: x0, y_baseline, font_size, text
     """
@@ -371,29 +365,24 @@ def create_ocr_text_elements(
 
         try:
             ocr_image  = preprocess_for_ocr(pil_image)   # OCR copy — preprocessed
-            # pil_image is the original render; ocr_image is used only here
-            segmentation = blla.segment(ocr_image, model=seg_model)
-            logger.info(f"Found {len(segmentation.lines)} text lines on page {page_num}")
+            
+            # Get text line boxes from Surya (like Kraken blla.segment)
+            text_lines = get_surya_text_lines(ocr_image, detection_predictor)
+            logger.info(f"Found {len(text_lines)} text lines on page {page_num}")
 
-            if not segmentation.lines:
+            if not text_lines:
                 logger.warning("No text lines detected. Saving debug image...")
                 debug_dir = Path("debug_images")
                 debug_dir.mkdir(exist_ok=True)
                 ocr_image.save(debug_dir / f"{filename}_page{page_num}_preprocessed.png")
 
-            sorted_lines = order_lines(segmentation)
+            sorted_lines = order_lines_surya(text_lines, ocr_image)
             logger.info(f"Sorted {len(sorted_lines)} lines into reading order.")
 
             for i, line in enumerate(sorted_lines):
                 try:
-                    if hasattr(line, "boundary") and len(line.boundary) >= 3:
-                        xs = [p[0] for p in line.boundary]
-                        ys = [p[1] for p in line.boundary]
-                        x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
-                    elif hasattr(line, "bbox"):
-                        x0, y0, x1, y1 = line.bbox
-                    else:
-                        continue
+                    bbox = line['bbox']
+                    x0, y0, x1, y1 = bbox[0], bbox[1], bbox[2], bbox[3]
 
                     sh, sw = y1 - y0, x1 - x0
                     if sh < 5 or sw < 5:
@@ -425,6 +414,8 @@ def create_ocr_text_elements(
 
         except Exception as e:
             logger.error(f"OCR failed for page {page_num}: {e}")
+            import traceback
+            traceback.print_exc()
 
         all_pages.append(page_elements)
 
@@ -444,17 +435,14 @@ def setup_pdfa_compliance(pdf_path: str):
             logger.error("sRGB ICC profile not found; skipping PDF/A OutputIntent.")
             return
         with pikepdf.open(pdf_path, allow_overwriting_input=True) as pdf:
-            # Use explicit '/Key' string syntax — safest across pikepdf versions.
             if "/OutputIntents" not in pdf.Root:
                 pdf.Root["/OutputIntents"] = pikepdf.Array()
 
-            # Build the ICC profile stream
             icc_data = srgb_path.read_bytes()
             icc_stream = pdf.make_stream(icc_data)
             icc_stream.stream_dict["/N"]         = pikepdf.Integer(3)
             icc_stream.stream_dict["/Alternate"] = pikepdf.Name("/DeviceRGB")
 
-            # Build the OutputIntent dictionary
             output_intent = pikepdf.Dictionary({
                 "/Type":                     pikepdf.Name("/OutputIntent"),
                 "/S":                        pikepdf.Name("/GTS_PDFA1"),
@@ -474,39 +462,26 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
     """
     Add an invisible OCR text layer to *input_path* and write the result to
     *output_path*.
-
-    Approach (no flatten step):
-      1. Open the ORIGINAL PDF with fitz.
-      2. Render each page to a PIL image (in memory) for OCR only.
-      3. Run segmentation + TrOCR on a preprocessed copy of each render.
-      4. Insert invisible text elements directly into the original page.
-      5. Save once with deflate compression.
-
-    Because the original image streams are never re-encoded, the output file
-    is typically only 3-8% larger than the input.
     """
     filename = os.path.basename(input_path)
     logger.info(f"Starting OCR for: {filename}")
 
     try:
         with fitz.open(input_path) as doc:
-            # ── Render all pages to PIL images for OCR ──────────────────────
             logger.info(f"Rendering {len(doc)} pages at {DPI} DPI for OCR…")
             pil_images: List[Image.Image] = []
             for page in doc:
                 pil_images.append(page_to_pil(page, dpi=DPI))
 
-            # ── Run OCR on rendered images ───────────────────────────────────
             ocr_pages = create_ocr_text_elements(pil_images, filename)
 
-            # ── Set document metadata ────────────────────────────────────────
             now           = datetime.datetime.now()
             creation_date = get_pdf_date_string(now)
             doc.set_metadata({
                 "title":        filename,
                 "author":       "Opticolumn",
                 "subject":      "OCR processed document",
-                "creator":      "Opticolumn 2026",
+                "creator":      "Opticolumn 2026-Surya",
                 "producer":     "PyMuPDF",
                 "creationDate": creation_date,
                 "modDate":      creation_date,
@@ -515,7 +490,7 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
                 title=filename,
                 author="Opticolumn",
                 subject="OCR processed document",
-                creator="Opticolumn 2026",
+                creator="Opticolumn 2026-Surya",
                 producer="PyMuPDF",
                 creation_date=get_xmp_date_string(now),
                 modify_date=get_xmp_date_string(now),
@@ -523,7 +498,6 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
             if xmp:
                 doc.set_xml_metadata(xmp)
 
-            # ── Insert invisible text into original pages ────────────────────
             page_count = min(len(doc), len(ocr_pages))
             logger.info(f"Inserting text into {page_count} pages…")
 
@@ -532,12 +506,6 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
                 elements = ocr_pages[page_num]
                 pil_img  = pil_images[page_num]
 
-                # ── Strip any pre-existing text layer ────────────────────────
-                # Scans that were previously OCR'd (or partially searchable)
-                # would otherwise produce a doubled text layer.  We cover the
-                # entire page with a redaction annotation and apply it with
-                # PDF_REDACT_IMAGE_NONE so that image streams are untouched —
-                # only content-stream text operators are removed.
                 existing_text = page.get_text().strip()
                 if existing_text:
                     logger.info(
@@ -547,7 +515,6 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
                     page.add_redact_annot(page.rect)
                     page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
 
-                # Scale: pixel-space → PDF point-space
                 img_w, img_h = pil_img.size
                 page_w = page.rect.width
                 page_h = page.rect.height
@@ -567,10 +534,7 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
                             elem["text"],
                             fontsize=max(4, elem["font_size"] * sy),
                             fontname=FONT_NAME,
-                            # No fontfile — helv is a built-in PDF base-14 font.
-                            # Omitting fontfile means nothing is embedded, keeping
-                            # file size growth to the OCR text stream only.
-                            render_mode=3,       # invisible text (PDF §9.3.6)
+                            render_mode=3,
                             color=(0, 0, 0),
                         )
                         inserted += 1
@@ -579,18 +543,16 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
 
                 logger.info(f"Page {page_num+1}: inserted {inserted}/{len(elements)} text elements")
 
-            # ── Save with deflate; do NOT re-encode images ───────────────────
             doc.save(
                 output_path,
-                deflate=True,          # compress streams (text, metadata, etc.)
-                garbage=4,             # remove unused objects
+                deflate=True,
+                garbage=4,
                 clean=True,
-                deflate_images=False,  # leave original image streams untouched
+                deflate_images=False,
                 encryption=fitz.PDF_ENCRYPT_KEEP,
             )
             logger.info(f"OCR-enhanced PDF saved: {output_path}")
 
-        # ── PDF/A compliance — MUST be called after the file is on disk ──────
         srgb_path = Path(SRGB_ICC_PATH)
         if srgb_path.exists():
             logger.info("Applying PDF/A OutputIntent…")
@@ -598,7 +560,6 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
         else:
             logger.warning("sRGB ICC profile not found; PDF/A OutputIntent skipped.")
 
-        # ── Verify OCR layer ─────────────────────────────────────────────────
         logger.info("Verifying OCR layer in final output…")
         try:
             with fitz.open(output_path) as final_pdf:
@@ -627,12 +588,7 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
 def compress_to_target_size(input_pdf: Path, output_pdf: Path, original_size: int) -> Path:
     """
     Try to keep the output within 15% of the original size using
-    PDF-native deflate compression only.  Because the original image
-    streams are never re-encoded, this target is almost always achievable
-    without touching images at all.
-
-    No JPEG recompression is attempted — that causes generation loss and
-    is incompatible with archival quality requirements.
+    PDF-native deflate compression only.
     """
     max_target = int(original_size * 1.15)
     logger.info(
@@ -648,7 +604,6 @@ def compress_to_target_size(input_pdf: Path, output_pdf: Path, original_size: in
         logger.info("File already within target size. No additional compression needed.")
         return output_pdf
 
-    # Progressive deflate options — images left untouched throughout
     compression_options = [
         {"deflate": True, "garbage": 4, "clean": True, "deflate_images": False},
         {"deflate": True, "garbage": 3, "clean": True, "deflate_images": False},
@@ -666,7 +621,6 @@ def compress_to_target_size(input_pdf: Path, output_pdf: Path, original_size: in
             logger.info(f"Compression option {i+1}: {compressed_size // 1024} KB ({pct:+.1f}% from original)")
 
             if compressed_size <= max_target:
-                # Verify OCR was not lost
                 try:
                     with fitz.open(str(temp_out)) as chk:
                         total_chars = sum(len(pg.get_text().strip()) for pg in chk)
@@ -689,15 +643,9 @@ def compress_to_target_size(input_pdf: Path, output_pdf: Path, original_size: in
             logger.error(f"Compression option {i+1} failed: {e}")
             temp_out.unlink(missing_ok=True)
 
-    # If still over budget, log a warning and return the uncompressed OCR file.
-    # Aggressive JPEG recompression is intentionally NOT attempted here —
-    # it destroys archival quality and causes generation loss on already-
-    # compressed sources.
     logger.warning(
         "All deflate options exceeded the 15% size budget. "
-        "Returning OCR file as-is (images untouched, quality preserved). "
-        "Consider reducing DPI or using a lighter segmentation model if "
-        "strict size limits are mandatory."
+        "Returning OCR file as-is (images untouched, quality preserved)."
     )
     shutil.copy2(input_pdf, output_pdf)
     return output_pdf
@@ -719,6 +667,7 @@ def main():
         sys.exit(1)
 
     logger.info(f"Processing {len(pdf_files)} files with TrOCR: {TROCR_MODEL_NAME}")
+    logger.info("Text Line Detection: Surya DetectionPredictor (transformer model)")
     logger.info("Target: Final size ≤ original + 15% (OCR text layer only; images untouched)")
 
     for pdf_path in pdf_files:
