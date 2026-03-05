@@ -1,1 +1,3 @@
-# opticolumn_b
+# opticolumns
+
+OCR tool developed by Andrew Weymouth, Digital Initiatives Librarian for University of Idaho, over summer and fall of 2025. The tool implements the TrOCR text recognition model and the Kraken BLLA page segmentation model to improve the accuracy of handwritten and cursive archival documents and add digital preservation metadata to processed materials. The tool was developed for overhauling the Center for Digital Inquiry and Learning's digital collection PDF files, to make the collection more discoverable and accessible. The development of the tool is written about in greater detail in _Transparent Practices: OCR and AI in the Archives_, by Rebecca Hastings and Andrew Weymouth. Forthcoming in _Collections: A Journal for Archives and Museum Professions_, 2026.
