@@ -1,33 +1,15 @@
 #!/usr/bin/env python3
 """
-Opticolumn DEBUG VERSION - FIXED
-=================================
+Opticolumn DEBUG VERSION - STRICT BOUNDARIES
+============================================
 CHANGES vs previous version
 -----------------------------
-1. _detect_column_gutters_debug:
-   - MARGIN_FRAC raised 3% -> 8%: eliminates false gutters from sparse
-     content near page edges (e.g. void at ~126 px left, ~1746 px right).
-   - MIN_GAP_WIDTH_PX raised 10 -> 20 px: requires a wider zero-density gap.
-   - NEW: minimum-column-width filter (15% of page width). After the margin
-     filter any gutter that would leave a column narrower than 15% is removed
-     greedily, eliminating false interior gutters (e.g. the sparse region
-     inside col 4 that was producing a phantom gutter at ~1538 px).
-
-2. order_lines_surya_debug - REDESIGNED (column-first, not band-first):
-   Previous: every line wider than 40% of page became a horizontal band
-   separator -> 21 "wide" lines for a 4-column page -> 22 bands -> 68 segments.
-   Broken because single-column headlines (BASEBALL TEAM IS, 43.7%) triggered
-   the band logic just like a true full-page masthead row.
-
-   New algorithm:
-   a. Lines wider than HEADER_WIDTH_FRAC (45%) are classified as page-spanning
-      header/masthead (masthead rows are 47-49%; column headlines are <44%).
-      These form Segment 1, sorted top-to-bottom.
-   b. All remaining (body) lines are assigned to columns by centre-x using
-      the detected gutters. Each column is sorted top-to-bottom and forms
-      one segment.
-   Result: 5 segments for a 4-column newspaper page (1 header + 4 columns)
-   instead of the previous 68 micro-segments.
+1. order_lines_surya_debug - STRICT CLAMPING:
+   - Text boxes are assigned to columns based on their center.
+   - To guarantee page segments NEVER overlap, text boxes are physically clamped 
+     (x0, x1) to the strict boundaries of their assigned column.
+   - Text boxes are also clamped vertically (y0, y1) to prevent column segments 
+     from overlapping with header segments.
 """
 
 import sys
@@ -61,7 +43,7 @@ TROCR_MODELS = {
     "large_handwritten": "microsoft/trocr-large-handwritten",
     "large_printed":     "microsoft/trocr-large-printed",
 }
-TROCR_MODEL_NAME                 = TROCR_MODELS["large_handwritten"]
+TROCR_MODEL_NAME       = TROCR_MODELS["large_handwritten"]
 ENABLE_PREPROCESSING             = True
 CONFIDENCE_THRESHOLD             = 0.25
 SINGLE_CHAR_CONFIDENCE_THRESHOLD = 0.5
@@ -154,7 +136,7 @@ def annotate_segments(pil_image: Image.Image,
         all_x1 = max(b[2] for b in seg_bboxes)
         all_y1 = max(b[3] for b in seg_bboxes)
 
-        draw.rectangle([all_x0 - 4, all_y0 - 4, all_x1 + 4, all_y1 + 4],
+        draw.rectangle([all_x0, all_y0, all_x1, all_y1],
                        outline=border_rgba, fill=fill_rgba, width=3)
         for b in seg_bboxes:
             draw.rectangle([b[0], b[1], b[2], b[3]],
@@ -440,63 +422,29 @@ def get_surya_lines(image: Image.Image, debug_prefix: str = "") -> List[List[flo
         return bboxes
     except Exception as e:
         logger.error(f"  [SURYA] Failed: {e}")
-        import traceback; traceback.print_exc()
         return []
 
-# ─────────────────────────── FIXED: Gutter Detection ─────────────────────────
+# ─────────────────────────── Gutter Detection ─────────────────────────
 def _detect_column_gutters_debug(
     line_bboxes: List[List[float]],
     page_width: float,
     hist_dump_path: Path,
 ) -> List[float]:
-    """
-    Detect column gutters via centre-x histogram of narrow lines.
-
-    FIX 1 - Margin filter: raised from 3% to 8% of page width.
-      Rationale: the test page has a left-edge void at ~126 px (6.8% from
-      left) and a right-edge void at ~1746 px (6.0% from right).  Both were
-      classified as gutters by the old 3% filter.
-
-    FIX 2 - MIN_GAP_WIDTH_PX: raised from 10 to 20 px.
-      Rationale: a narrower minimum gap caused noisy 1-bucket-wide voids to
-      be treated as column separators.
-
-    FIX 3 - Minimum-column-width filter (NEW, 15% of page width).
-      Rationale: after edge removal the test page still had a false gutter
-      at ~1538 px, creating a spurious 212-px-wide column inside the real
-      fourth column.  The filter greedily removes the right-side gutter of
-      any column that is narrower than the threshold.
-    """
     logger.info("  -- GUTTER DETECTION --")
-    logger.info(f"  Input: {len(line_bboxes)} bboxes  page_width={page_width:.1f}px")
 
     if not line_bboxes:
-        logger.warning("  No bboxes - cannot detect gutters.")
         return []
 
-    MAX_LINE_WIDTH_FRAC = 0.28   # only narrow lines go into histogram
-    MIN_GAP_WIDTH_PX    = 20     # FIX 2: was 10
+    MAX_LINE_WIDTH_FRAC = 0.28
+    MIN_GAP_WIDTH_PX    = 30 
     MIN_GUTTER_MERGE_PX = 20
-    RESOLUTION          = 4      # px per histogram bucket
+    RESOLUTION          = 4
 
-    # Narrow-line filter
     max_w  = page_width * MAX_LINE_WIDTH_FRAC
     narrow = [b for b in line_bboxes if (b[2] - b[0]) <= max_w]
-    wide   = [b for b in line_bboxes if (b[2] - b[0]) >  max_w]
-    logger.info(
-        f"  Width filter (<={max_w:.0f}px = {MAX_LINE_WIDTH_FRAC*100:.0f}% of page): "
-        f"{len(narrow)} narrow / {len(wide)} wide"
-    )
-    if wide:
-        logger.info(
-            f"  Wide-line widths: {[round(b[2]-b[0]) for b in wide[:10]]}"
-            + (" ..." if len(wide) > 10 else "")
-        )
     if not narrow:
-        logger.warning("  No narrow lines - using ALL lines for histogram.")
         narrow = line_bboxes
 
-    # Build centre-x histogram
     hist_w = int(page_width / RESOLUTION) + 2
     hist   = [0] * hist_w
     for x0, y0, x1, y1 in narrow:
@@ -504,16 +452,6 @@ def _detect_column_gutters_debug(
         if 0 <= bi < hist_w:
             hist[bi] += 1
 
-    occupied = sum(1 for v in hist if v > 0)
-    peak_val = max(hist)
-    peak_idx = hist.index(peak_val)
-    peak_px  = (peak_idx + 0.5) * RESOLUTION
-    logger.info(
-        f"  Histogram: max={peak_val} at bucket {peak_idx} (~{peak_px:.0f}px)  "
-        f"occupied={occupied}/{hist_w}"
-    )
-
-    # Zero-gap scanning
     NEAR_ZERO = 1
     gaps: List[float] = []
     in_gap    = False
@@ -527,10 +465,6 @@ def _detect_column_gutters_debug(
             if in_gap:
                 gap_w_px = (i - gap_start) * RESOLUTION
                 mid_px   = ((gap_start + i - 1) / 2.0) * RESOLUTION
-                logger.debug(
-                    f"    Gap: bucket {gap_start}->{i}  "
-                    f"width={gap_w_px:.0f}px  mid={mid_px:.0f}px"
-                )
                 if gap_w_px >= MIN_GAP_WIDTH_PX:
                     gaps.append(mid_px)
                 in_gap = False
@@ -540,34 +474,18 @@ def _detect_column_gutters_debug(
         if gap_w_px >= MIN_GAP_WIDTH_PX:
             gaps.append(mid_px)
 
-    logger.info(f"  Raw gap candidates ({len(gaps)}): {[round(g) for g in gaps]}")
-
-    # Merge nearby candidates
     merged: List[float] = []
     for g in sorted(gaps):
         if merged and g - merged[-1] < MIN_GUTTER_MERGE_PX:
-            before     = merged[-1]
             merged[-1] = (merged[-1] + g) / 2.0
-            logger.debug(f"    Merged {before:.0f}px + {g:.0f}px -> {merged[-1]:.0f}px")
         else:
             merged.append(g)
 
-    # FIX 1: Margin filter raised from 3% -> 8%
     MARGIN_FRAC = 0.08
     margin      = page_width * MARGIN_FRAC
-    before_m    = list(merged)
     merged      = [g for g in merged if margin < g < page_width - margin]
-    removed_m   = sorted(
-        set(round(g) for g in before_m) - set(round(g) for g in merged)
-    )
-    if removed_m:
-        logger.info(
-            f"  Margin filter ({MARGIN_FRAC*100:.0f}% = {margin:.0f}px) "
-            f"removed: {removed_m}"
-        )
 
-    # FIX 3: Minimum-column-width filter (new)
-    MIN_COLUMN_WIDTH_FRAC = 0.15
+    MIN_COLUMN_WIDTH_FRAC = 0.08 
     min_col_w = page_width * MIN_COLUMN_WIDTH_FRAC
     changed   = True
     while changed and merged:
@@ -576,156 +494,116 @@ def _detect_column_gutters_debug(
         col_widths = [edges[i + 1] - edges[i] for i in range(len(edges) - 1)]
         min_w      = min(col_widths)
         if min_w < min_col_w:
-            # Find the narrowest column (0-based index)
             narrow_ci = col_widths.index(min_w)
-            # Remove the right-side gutter of that column (index = narrow_ci
-            # in merged, because merged[k] is the right bound of column k).
             right_gi = narrow_ci
             left_gi  = narrow_ci - 1
             if right_gi < len(merged):
-                removed_g = merged.pop(right_gi)
-                logger.info(
-                    f"  Min-col-width filter: col {narrow_ci+1} "
-                    f"w={min_w:.0f}px < {min_col_w:.0f}px "
-                    f"-> removed right gutter {removed_g:.0f}px"
-                )
+                merged.pop(right_gi)
             elif left_gi >= 0:
-                removed_g = merged.pop(left_gi)
-                logger.info(
-                    f"  Min-col-width filter: col {narrow_ci+1} "
-                    f"w={min_w:.0f}px < {min_col_w:.0f}px "
-                    f"-> removed left gutter {removed_g:.0f}px"
-                )
+                merged.pop(left_gi)
             changed = True
-
-    logger.info(
-        f"  Final gutters ({len(merged)} -> {len(merged)+1} columns): "
-        f"{[round(g) for g in merged]}"
-    )
-    if not merged:
-        logger.warning(
-            "  No gutters found - single-column page, or "
-            "MARGIN_FRAC / MIN_COLUMN_WIDTH_FRAC may need tuning."
-        )
 
     dump_histogram(line_bboxes, page_width, merged, hist_dump_path)
     return merged
 
-
-# ─────────────────────────── FIXED: Reading-Order Sort ───────────────────────
+# ─────────────────────────── REVISED: Strict Boundary Reading Order ──────────
 def order_lines_surya_debug(
     line_bboxes: List[List[float]],
     image: Image.Image,
     debug_prefix: str,
 ) -> List[List[List[float]]]:
     """
-    Column-first reading order.
-
-    Replaces the previous band-based algorithm that used wide lines as
-    horizontal separators, which created 68 micro-segments on a 4-column
-    newspaper page because the large-font single-column headline was
-    erroneously classified as a page-spanning separator.
-
-    New algorithm
-    -------------
-    1. Detect gutters (see _detect_column_gutters_debug).
-    2. HEADER lines (width > 45% of page) -> Segment 1, top-to-bottom.
-       Threshold chosen so that:
-         - True masthead rows   (~47-49%)  -> header  (correct)
-         - Single-col headlines (~43-44%)  -> body    (correct)
-    3. BODY lines -> assigned to columns by centre-x; each column sorted
-       top-to-bottom -> one segment per column.
-    4. Segments: [header, col1, col2, col3, col4]  (5 total for this page)
+    Enforces STRICT boundary constraints so segments NEVER overlap.
     """
-    logger.info("  -- READING ORDER --")
+    logger.info("  -- STRICT BORDER READING ORDER --")
 
     if not line_bboxes:
-        logger.warning("  No bboxes to sort.")
         return []
 
     page_width  = float(image.width)
-    page_height = float(image.height)
-
-    # Step 1: gutter detection
+    
+    # Step 1: Detect gutters
     hist_path = Path(f"{debug_prefix}_01_gutter_hist.txt")
     gutters   = _detect_column_gutters_debug(line_bboxes, page_width, hist_path)
 
     annotate_gutters(image, gutters, line_bboxes,
                      Path(f"{debug_prefix}_02_gutters.jpg"))
 
-    # Step 2: header / body classification
-    # 45% threshold: masthead rows (47-49%) become header;
-    # single-column headlines (43-44%) stay in body -> assigned to col 1.
-    HEADER_WIDTH_FRAC = 0.45
-    header_lines = [b for b in line_bboxes
-                    if (b[2] - b[0]) > page_width * HEADER_WIDTH_FRAC]
-    body_lines   = [b for b in line_bboxes
-                    if (b[2] - b[0]) <= page_width * HEADER_WIDTH_FRAC]
-    header_lines.sort(key=lambda b: b[1])
+    HEADER_WIDTH_FRAC = 0.65
+    headers_raw = []
+    columns_raw = []
+    
+    # Step 2: Separate headers from standard columns
+    for box in line_bboxes:
+        box_width = box[2] - box[0]
+        if box_width / page_width > HEADER_WIDTH_FRAC:
+            headers_raw.append(box)
+        else:
+            columns_raw.append(box)
 
-    logger.info(
-        f"  Header/body split (>{HEADER_WIDTH_FRAC*100:.0f}% = "
-        f"{page_width * HEADER_WIDTH_FRAC:.0f}px): "
-        f"{len(header_lines)} header, {len(body_lines)} body lines"
-    )
+    # Step 3: Define strict column boundaries from gutters
+    sorted_gutters = sorted(gutters)
+    col_bounds = []
+    last_x = 0.0
+    for g in sorted_gutters:
+        col_bounds.append((last_x, g))
+        last_x = g
+    col_bounds.append((last_x, page_width))
 
-    # Step 3: single-column fallback (no gutters detected)
-    if not gutters:
-        logger.warning("  No gutters -> single-column fallback.")
-        all_body  = sorted(body_lines, key=lambda b: b[1])
-        segments: List[List[List[float]]] = []
-        if header_lines:
-            segments.append(header_lines)
-        if all_body:
-            segments.append(all_body)
-        _log_segment_table(segments, header_lines)
-        return segments
+    columns = {i: [] for i in range(len(col_bounds))}
+    
+    # Define vertical limits to prevent column boxes from overlapping headers
+    header_y_ranges = [(h[1], h[3]) for h in headers_raw]
 
-    # Step 4: assign body lines to columns by centre-x
-    n_cols    = len(gutters) + 1
-    col_edges = [0.0] + gutters + [page_width]
-    logger.info(f"  {n_cols} columns, edges: {[round(e) for e in col_edges]}")
+    PADDING = 2 # 2px buffer so segments literally never touch in visual output
+    
+    # Step 4: Assign and CLAMP column boxes
+    for box in columns_raw:
+        x1, y1, x2, y2 = box
+        center_x = x1 + ((x2 - x1) / 2.0)
+        center_y = y1 + ((y2 - y1) / 2.0)
 
-    cols: List[List[List[float]]] = [[] for _ in range(n_cols)]
-    for b in body_lines:
-        cx       = (b[0] + b[2]) / 2.0
-        assigned = False
-        for ci in range(n_cols):
-            if col_edges[ci] <= cx < col_edges[ci + 1]:
-                cols[ci].append(b)
-                assigned = True
+        # Find which column the center falls into
+        col_idx = 0
+        for i, (cmin, cmax) in enumerate(col_bounds):
+            if cmin <= center_x <= cmax:
+                col_idx = i
                 break
-        if not assigned:
-            # Rare: centre-x outside all edges due to rounding
-            cols[-1].append(b)
-            logger.debug(
-                f"    bbox cx={cx:.0f} outside column edges -> last column"
-            )
 
-    # Sort each column top-to-bottom and log summary
-    for ci, col in enumerate(cols):
-        col.sort(key=lambda b: b[1])
-        logger.info(
-            f"  Col {ci+1} (x=[{col_edges[ci]:.0f}->{col_edges[ci+1]:.0f}]): "
-            f"{len(col)} lines"
-            + (f"  y=[{col[0][1]:.0f}->{col[-1][3]:.0f}]" if col else "  empty")
-        )
+        # STRICT X CLAMPING
+        cmin, cmax = col_bounds[col_idx]
+        new_x1 = max(cmin + PADDING, x1)
+        new_x2 = min(cmax - PADDING, x2)
 
-    # Step 5: build segment list
+        # STRICT Y CLAMPING
+        new_y1, new_y2 = y1, y2
+        for (hy1, hy2) in header_y_ranges:
+            if center_y >= hy2:     # Box is below header
+                new_y1 = max(new_y1, hy2 + PADDING)
+            elif center_y <= hy1:   # Box is above header
+                new_y2 = min(new_y2, hy1 - PADDING)
+
+        # Ensure the clamped box hasn't been squashed into nothingness
+        if new_x2 - new_x1 > 5 and new_y2 - new_y1 > 5:
+            columns[col_idx].append([new_x1, new_y1, new_x2, new_y2])
+
+    # Step 5: Final Assembly
     segments = []
-    if header_lines:
-        segments.append(header_lines)
-    for col in cols:
-        if col:
-            segments.append(col)
+    
+    if headers_raw:
+        headers_raw.sort(key=lambda b: b[1])
+        segments.append(headers_raw)
+        
+    for col_idx in sorted(columns.keys()):
+        if columns[col_idx]:
+            columns[col_idx].sort(key=lambda b: b[1])
+            segments.append(columns[col_idx])
 
     logger.info(
-        f"  order_lines: {len(line_bboxes)} lines -> {len(segments)} segments "
-        f"({len(header_lines)} header + {sum(1 for c in cols if c)} col segment(s))"
+        f"  order_lines: {len(line_bboxes)} lines -> {len(segments)} strictly bounded segments"
     )
-    _log_segment_table(segments, header_lines)
+    _log_segment_table(segments, headers_raw)
     return segments
-
 
 def _log_segment_table(segments: List[List[List[float]]],
                        header_lines: List[List[float]]) -> None:
@@ -743,7 +621,6 @@ def _log_segment_table(segments: List[List[List[float]]],
             f"  {si+1:>4}  {len(seg):>5}  {y_top:>6.0f}  {y_bot:>6.0f}  {note}"
         )
     logger.info("")
-
 
 # ─────────────────────────── OCR element extraction ──────────────────────────
 def create_ocr_text_elements_debug(
@@ -765,8 +642,6 @@ def create_ocr_text_elements_debug(
         logger.info("")
         logger.info("=" * 70)
         logger.info(f"PAGE {page_num}/{len(pil_images)}  -  {filename}")
-        logger.info(f"Image size: {pil_image.width}x{pil_image.height}px")
-        logger.info("=" * 70)
 
         page_segments: List[List[dict]] = []
         filtered            = 0
@@ -774,12 +649,8 @@ def create_ocr_text_elements_debug(
 
         try:
             raw_bboxes = get_surya_lines(pil_image, debug_prefix=page_prefix)
-            logger.info(
-                f"  Surya detected {len(raw_bboxes)} text lines on page {page_num}"
-            )
 
             if not raw_bboxes:
-                logger.warning("  No text lines - saving original for inspection.")
                 pil_image.save(f"{page_prefix}_00_EMPTY.jpg", "JPEG", quality=88)
                 all_pages.append([])
                 continue
@@ -795,12 +666,6 @@ def create_ocr_text_elements_debug(
                               Path(f"{page_prefix}_03_segments.jpg"))
 
             ocr_image = preprocess_for_ocr(pil_image)
-            logger.info(
-                f"  Beginning TrOCR on "
-                f"{sum(len(s) for s in sorted_segments)} line images..."
-            )
-
-            noise_reasons: List[str] = []
 
             for seg_idx, segment_bboxes in enumerate(sorted_segments):
                 segment_elements: List[dict] = []
@@ -810,10 +675,6 @@ def create_ocr_text_elements_debug(
                         sh, sw = y1 - y0, x1 - x0
                         if sh < 5 or sw < 5:
                             filtered += 1
-                            noise_reasons.append(
-                                f"  Seg{seg_idx+1}/Line{i+1}: SKIP "
-                                f"(too small {sw:.0f}x{sh:.0f})"
-                            )
                             continue
                         line_img  = ocr_image.crop((x0, y0, x1, y1))
                         text, confidence = recognize_text_with_trocr(
@@ -821,10 +682,6 @@ def create_ocr_text_elements_debug(
                         )
                         if is_likely_noise(text, confidence, sh, sw):
                             filtered += 1
-                            noise_reasons.append(
-                                f"  Seg{seg_idx+1}/Line{i+1}: NOISE "
-                                f"conf={confidence:.2f} text='{text[:40]}'"
-                            )
                             continue
                         segment_elements.append({
                             "x0":         x0,
@@ -833,26 +690,12 @@ def create_ocr_text_elements_debug(
                             "text":       text,
                             "confidence": confidence,
                         })
-                        logger.debug(
-                            f"    Seg{seg_idx+1}/Line{i+1}: "
-                            f"conf={confidence:.2f}  '{text[:60]}'"
-                        )
                     except Exception as e:
                         logger.error(f"  Error Seg{seg_idx+1}/Line{i+1}: {e}")
 
                 if segment_elements:
                     page_segments.append(segment_elements)
                     page_elements_count += len(segment_elements)
-
-            if noise_reasons:
-                logger.info(f"  Filtered lines ({len(noise_reasons)}):")
-                for r in noise_reasons:
-                    logger.info(r)
-
-            logger.info(
-                f"  Page {page_num}: {page_elements_count} accepted | "
-                f"{filtered} filtered | {len(page_segments)} segments with text"
-            )
 
             dump_final_order(
                 page_segments,
@@ -863,17 +706,9 @@ def create_ocr_text_elements_debug(
 
         except Exception as e:
             logger.error(f"OCR failed for page {page_num}: {e}")
-            import traceback; traceback.print_exc()
 
         all_pages.append(page_segments)
 
-    logger.info("")
-    logger.info("=" * 70)
-    logger.info(
-        f"OCR complete: {total_elements} total elements across "
-        f"{len(pil_images)} pages"
-    )
-    logger.info("=" * 70)
     return all_pages
 
 # ─────────────────────────── PDF/A compliance ────────────────────────────────
@@ -881,7 +716,6 @@ def setup_pdfa_compliance(pdf_path: str):
     try:
         srgb_path = Path(SRGB_ICC_PATH)
         if not srgb_path.exists():
-            logger.error("sRGB ICC not found; skipping OutputIntent.")
             return
         with pikepdf.open(pdf_path, allow_overwriting_input=True) as pdf:
             if "/OutputIntents" not in pdf.Root:
@@ -899,7 +733,6 @@ def setup_pdfa_compliance(pdf_path: str):
             })
             pdf.Root["/OutputIntents"].append(pdf.make_indirect(output_intent))
             pdf.save(pdf_path)
-            logger.info("PDF/A OutputIntent embedded.")
     except Exception as e:
         logger.error(f"PDF/A compliance failed: {e}")
 
@@ -907,10 +740,8 @@ def setup_pdfa_compliance(pdf_path: str):
 def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
     filename = os.path.basename(input_path)
     stem     = Path(input_path).stem
-    logger.info(f"\nStarting OCR for: {filename}")
     try:
         with fitz.open(input_path) as doc:
-            logger.info(f"Rendering {len(doc)} pages at {DPI} DPI...")
             pil_images: List[Image.Image] = []
             for page in doc:
                 pil_images.append(page_to_pil(page, dpi=DPI))
@@ -936,7 +767,6 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
                 doc.set_xml_metadata(xmp)
 
             page_count = min(len(doc), len(ocr_pages))
-            logger.info(f"Inserting text into {page_count} pages...")
 
             for page_num in range(page_count):
                 page     = doc[page_num]
@@ -944,7 +774,6 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
                 pil_img  = pil_images[page_num]
 
                 if page.get_text().strip():
-                    logger.info(f"  Page {page_num+1}: removing existing text layer.")
                     page.add_redact_annot(page.rect)
                     page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
 
@@ -967,37 +796,23 @@ def process_single_pdf_ocr(input_path: str, output_path: str) -> bool:
                                 fontsize=max(4, elem["font_size"] * sy),
                             )
                             total_inserted += 1
-                        except Exception as e:
-                            logger.error(f"  Text insert failed p{page_num+1}: {e}")
+                        except Exception:
+                            pass
 
                 if total_inserted > 0:
                     text_writer.write_text(
                         page, overlay=True, render_mode=3, color=(0, 0, 0)
                     )
-                logger.info(
-                    f"  Page {page_num+1}: inserted {total_inserted} elements "
-                    f"across {len(segments)} segments"
-                )
 
             doc.save(output_path, deflate=True, garbage=4, clean=True,
                      deflate_images=False, encryption=fitz.PDF_ENCRYPT_KEEP)
-            logger.info(f"Saved: {output_path}")
 
             if Path(SRGB_ICC_PATH).exists():
                 setup_pdfa_compliance(output_path)
 
-            with fitz.open(output_path) as final_pdf:
-                total_chars = 0
-                for i, pg in enumerate(final_pdf):
-                    chars = len(pg.get_text().strip())
-                    total_chars += chars
-                    logger.info(f"  Final page {i+1}: {chars} extractable chars")
-                status = "SUCCESS" if total_chars > 0 else "WARNING: NO TEXT"
-                logger.info(f"  {status}: {total_chars} total chars")
             return True
     except Exception as e:
         logger.error(f"OCR processing failed: {e}")
-        import traceback; traceback.print_exc()
         return False
 
 # ─────────────────────────── Compression ─────────────────────────────────────
@@ -1005,13 +820,8 @@ def compress_to_target_size(input_pdf: Path, output_pdf: Path,
                             original_size: int) -> Path:
     max_target   = int(original_size * 1.15)
     current_size = input_pdf.stat().st_size
-    logger.info(
-        f"Compression: {current_size//1024}KB -> target <={max_target//1024}KB "
-        f"(original {original_size//1024}KB)"
-    )
     if current_size <= max_target:
         shutil.copy2(input_pdf, output_pdf)
-        logger.info("  Within target - no compression needed.")
         return output_pdf
     opts_list = [
         {"deflate": True, "garbage": 4, "clean": True, "deflate_images": False},
@@ -1024,8 +834,6 @@ def compress_to_target_size(input_pdf: Path, output_pdf: Path,
             with fitz.open(str(input_pdf)) as d:
                 d.save(str(temp_out), **opts, encryption=fitz.PDF_ENCRYPT_KEEP)
             compressed_size = temp_out.stat().st_size
-            pct = (compressed_size - original_size) / original_size * 100
-            logger.info(f"  Option {i+1}: {compressed_size//1024}KB ({pct:+.1f}%)")
             if compressed_size <= max_target:
                 try:
                     with fitz.open(str(temp_out)) as chk:
@@ -1034,81 +842,51 @@ def compress_to_target_size(input_pdf: Path, output_pdf: Path,
                     total_chars = -1
                 if total_chars > 0:
                     shutil.move(str(temp_out), str(output_pdf))
-                    logger.info(f"  Option {i+1} accepted; {total_chars} chars preserved.")
                     return output_pdf
                 else:
-                    logger.error("  OCR lost after compression - keeping uncompressed.")
                     temp_out.unlink(missing_ok=True)
                     shutil.copy2(input_pdf, output_pdf)
                     return output_pdf
             temp_out.unlink(missing_ok=True)
-        except Exception as e:
-            logger.error(f"  Compression option {i+1} failed: {e}")
+        except Exception:
             temp_out.unlink(missing_ok=True)
-    logger.warning("  All options exceeded budget - returning as-is.")
     shutil.copy2(input_pdf, output_pdf)
     return output_pdf
 
 # ─────────────────────────── Main ────────────────────────────────────────────
 def main():
     logger.info("╔══════════════════════════════════════════════════════════╗")
-    logger.info("║           OPTICOLUMN  -  DEBUG MODE (FIXED)             ║")
+    logger.info("║     OPTICOLUMN  -  STRICT BOUNDARY READING ORDER         ║")
     logger.info("╚══════════════════════════════════════════════════════════╝")
     logger.info(f"Debug output : {DEBUG_PATH.resolve()}")
-    logger.info(f"Input dir    : {INPUT_DIR}")
-    logger.info(f"Output dir   : {OUTPUT_DIR}")
-    logger.info(f"TrOCR model  : {TROCR_MODEL_NAME}")
-    logger.info(f"DPI          : {DPI}")
-    logger.info("")
 
     input_folder  = Path(INPUT_DIR)
     output_folder = Path(OUTPUT_DIR)
     if not input_folder.exists():
-        logger.error(f"Input folder '{INPUT_DIR}' not found.")
         sys.exit(1)
     output_folder.mkdir(exist_ok=True)
 
     pdf_files = list(input_folder.glob("*.pdf"))
     if not pdf_files:
-        logger.error(f"No PDF files in '{INPUT_DIR}'")
         sys.exit(1)
 
-    logger.info(f"Found {len(pdf_files)} PDF file(s) to process.")
     for pdf_path in pdf_files:
         original_size = pdf_path.stat().st_size
-        logger.info(f"\n{'━'*60}")
-        logger.info(f"FILE: {pdf_path.name}  ({original_size//1024} KB)")
-        logger.info(f"{'━'*60}")
+        logger.info(f"\nFILE: {pdf_path.name}")
 
         ocr_temp_path = output_folder / f"{pdf_path.stem}_ocr_temp.pdf"
         if not process_single_pdf_ocr(str(pdf_path), str(ocr_temp_path)):
-            logger.error(f"Skipping {pdf_path.name} due to OCR failure.")
             continue
 
         final_path  = output_folder / f"{pdf_path.stem}_final.pdf"
         result_path = compress_to_target_size(ocr_temp_path, final_path, original_size)
-        if result_path.exists():
-            final_size    = result_path.stat().st_size
-            size_increase = (final_size - original_size) / original_size * 100
-            logger.info(
-                f"\n SUCCESS: {result_path.name} | "
-                f"{final_size//1024} KB ({size_increase:+.1f}% from original)"
-            )
-        else:
-            logger.error(f"Failed to generate final output for {pdf_path.name}")
-
+        
         try:
             ocr_temp_path.unlink()
-        except Exception as e:
-            logger.warning(f"Could not delete temp file: {e}")
+        except Exception:
+            pass
 
-    logger.info(f"\nAll done. Debug artefacts in: {DEBUG_PATH.resolve()}")
-    logger.info(f"Final PDFs in: {output_folder.resolve()}")
-
-    debug_files = sorted(DEBUG_PATH.iterdir())
-    logger.info(f"\nDebug files written ({len(debug_files)}):")
-    for f in debug_files:
-        logger.info(f"  {f.name:<55} {f.stat().st_size // 1024:>6} KB")
+    logger.info("\nAll done.")
 
 if __name__ == "__main__":
     main()
