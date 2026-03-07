@@ -1,54 +1,7 @@
 #!/usr/bin/env python3
 """
-Opticolumn  –  SURYA LAYOUT  /  TrOCR RECOGNITION  (HYBRID EDITION)
+Opticolumns
 ======================================================================
-Historic Newspaper Page Segmentation, Reading Order & OCR
-
-ARCHITECTURE
-------------
-Stage 1  Surya LayoutPredictor
-         Detects semantic regions (Section-header, Text, Caption, Table,
-         Picture, Page-header, etc.) with a native `position` field that
-         encodes column-aware reading order.  Identical to the Surya-native
-         edition.
-
-Stage 2  Surya DetectionPredictor  +  TrOCR
-         Within each layout region crop, DetectionPredictor segments the crop
-         into individual text lines.  Each line image is then passed to the
-         TrOCR VisionEncoderDecoder model for character recognition.
-
-         Two-pass strategy for single-block regions (Section-header,
-         Page-header, Caption, Footnote):
-           Pass 1 — DetectionPredictor finds lines; TrOCR reads each one.
-           Pass 2 — If Pass 1 returns nothing, the whole crop is fed to TrOCR
-                    as a single image.  This handles full-width banner headlines
-                    where the crop IS the line and DetectionPredictor finds no
-                    internal boundaries.
-
-Stage 3  Assemble & write
-         Elements are ordered by Surya layout `position`, then vertical
-         baseline within each region.  An invisible text layer is stamped into
-         the output PDF for searchability.
-
-WHY THIS COMBINATION
---------------------
-* Surya LayoutPredictor handles newspaper column structure far better than any
-  histogram-based gutter detection — it was trained on real document layouts.
-
-* TrOCR (microsoft/trocr-large-handwritten) was specifically trained on
-  handwritten and aged printed text, making it well-suited to historic
-  newspapers with degraded ink, uneven baselines, and period typefaces.
-
-* Keeping Surya for detection and layout while using TrOCR for recognition
-  allows direct A/B comparison against the all-Surya edition
-  (opticolumn_surya_native.py) on the same layout segmentation.
-
-USAGE
------
-1. Drop PDF files into the A/ folder.
-2. pip install surya-ocr pymupdf pikepdf pillow transformers torch
-3. python opticolumn_trocr_hybrid.py
-Output PDFs land in B/; debug images and reports land in debug/.
 """
 
 import sys
@@ -96,7 +49,7 @@ TROCR_MODELS = {
     "large_handwritten": "microsoft/trocr-large-handwritten",
     "large_printed":     "microsoft/trocr-large-printed",
 }
-TROCR_MODEL_NAME = TROCR_MODELS["large_handwritten"]
+TROCR_MODEL_NAME = TROCR_MODELS["large_printed"]
 
 # ── TrOCR noise-filter thresholds ────────────────────────────────────────────
 # TrOCR does not expose per-token probabilities in the same way as Surya;
