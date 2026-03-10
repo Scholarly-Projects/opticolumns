@@ -2,9 +2,10 @@
 """
 Opticolumns
 ======================================================================
-Revised: added auxiliary_layout_pass() after initial Surya layout
-detection to recover columns that the model misses on historic
-multi-column newsprint.
+Revised: added auxiliary_pass() after initial Surya layout detection
+to efficiently recover columns that Surya misses on historic multi-
+column newsprint.  Uses batched TrOCR and per-band DetectionPredictor
+instead of feeding auxiliary regions through the main OCR loop.
 ======================================================================
 """
 
@@ -172,6 +173,11 @@ AUX_LINE_GAP_FRAC = 1 / 60
 # on each side is excluded from auxiliary column search to avoid picking up
 # decorative borders, torn edges, or scan artefacts on aged newsprint.
 AUX_MARGIN_FRAC = 0.01
+
+# Number of line crops to feed to TrOCR in a single batched generate() call.
+# Larger batches improve GPU utilisation; on CPU a batch of 8–16 is typically
+# optimal.  Reduce if you encounter out-of-memory errors on small GPUs.
+AUX_TROCR_BATCH_SIZE = 12
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -443,99 +449,39 @@ def parse_layout_result(result) -> Tuple[List[Dict], Optional[List[float]]]:
 # AUXILIARY LAYOUT PASS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def auxiliary_layout_pass(
+def _find_missed_bands(
     page_image: Image.Image,
     existing_regions: List[Dict],
-    last_position: int,
-) -> List[Dict]:
+) -> List[Tuple[int, int]]:
     """
-    Recover text columns that Surya's LayoutPredictor missed.
+    Return a list of (x0, x1) column bands on this page that Surya missed.
 
-    Historic multi-column newspapers (8–10 columns, aged newsprint) routinely
-    cause Surya to miss 2–4 full columns per page because the model was trained
-    predominantly on contemporary single- or double-column documents.
-
-    Root-cause analysis of the v1 auxiliary pass (which returned a single whole-
-    page region) identified two failure modes that are corrected here:
-
-    Failure 1 — Smoothing kernel too wide
-        The previous kernel (AUX_HSMOOTH_FRAC = 1/100, ~85 px at 8500 px page
-        width) was wide enough to bridge genuine inter-column gutters (~60–100 px
-        on 300 DPI broadsheets), merging ALL columns into one continuous band.
-        Fix: use 1/400 (~21 px), which bridges intra-character gaps within a
-        column without crossing column gutters.
-
-    Failure 2 — Coverage mask obscures missed columns
-        Surya's bboxes for the columns flanking a missed column typically extend
-        100–200 px into that column's x-range.  The previous code built a 2-D
-        pixel coverage mask and projected only "uncovered" ink, so the missed
-        column's ink was invisible — its coverage appeared 100 % because the
-        adjacent regions' bboxes overlapped it from both sides.
-        Fix: project the FULL page ink to detect all column positions, then use
-        Surya region-centre DENSITY (not bbox coverage) to decide whether each
-        detected column has already been adequately identified.  A column whose
-        x-range contains ≤ AUX_MAX_CENTRE_COUNT Surya region centres is treated
-        as missed — this correctly flags the 1888 column at x ≈ 6 800–7 200
-        (0 centres) while leaving columns with 8–37 centres untouched.
-
-    Algorithm
-    ─────────
-    1.  Binarise with adaptive ink threshold tuned for aged newsprint.
-    2.  Compute horizontal ink projection over the FULL page (sum dark pixels
-        per column of pixels, axis=0), smoothed with a narrow kernel.
-    3.  Exclude a thin page-edge margin (AUX_MARGIN_FRAC) to ignore torn
-        borders and scan artefacts.
-    4.  Collect contiguous x-runs above the ink floor as candidate column bands.
-    5.  Merge bands separated by a very narrow gap (< AUX_MIN_GUTTER_FRAC × iw)
-        to suppress micro-fragments from decorative rules.
-    6.  For each band wider than AUX_MIN_COL_WIDTH_FRAC × iw:
-        a. Count Surya region centres (x midpoints) that fall within the band.
-        b. If count > AUX_MAX_CENTRE_COUNT → Surya covered it; skip.
-        c. Verify minimum ink density (avoids spurious hits in margins).
-        d. Compute per-row ink within the band; smooth and threshold to find
-           vertical text extent.
-        e. Merge close y-runs (gap ≤ AUX_LINE_GAP_FRAC × ih) into single blocks.
-        f. Each block becomes one auxiliary "Text" region.
-
-    All returned regions carry auxiliary=True.  They are rendered in
-    AUXILIARY_COLOUR (amber) in the debug visualisation.
-
-    Parameters
-    ──────────
-    page_image       : preprocessed RGB PIL Image
-    existing_regions : Surya regions already detected
-    last_position    : highest reading-order position from Surya; auxiliary
-                       regions continue from last_position + 1
-
-    Returns
-    ───────
-    List of new region dicts (may be empty).  Does NOT modify existing_regions.
+    Uses a full-page ink projection to locate all columns, then filters out
+    bands whose x-range already contains more than AUX_MAX_CENTRE_COUNT Surya
+    region centres.  Pure numpy — typically < 100 ms per page.
     """
     iw, ih = page_image.size
 
-    # ── 1. Ink mask ───────────────────────────────────────────────────────────
+    # Ink mask
     gray_arr  = np.array(page_image.convert("L"), dtype=np.float32)
     mu        = gray_arr.mean()
     sigma     = gray_arr.std()
     threshold = float(np.clip(mu - AUX_INK_ADAPTIVE_FACTOR * sigma, 50.0, 200.0))
-    ink       = (gray_arr < threshold).astype(np.float32)  # 1 = dark (text)
+    ink       = (gray_arr < threshold).astype(np.float32)
 
-    # ── 2. Full-page horizontal ink projection ────────────────────────────────
-    # Project ALL ink (not just uncovered) so adjacent Surya regions extending
-    # into a missed column cannot hide that column's ink signal.
-    vert_proj = ink.sum(axis=0)                            # shape (iw,)
-
+    # Horizontal projection over the full page (not masked by coverage)
+    vert_proj = ink.sum(axis=0)
     hk = max(3, int(iw * AUX_HSMOOTH_FRAC))
-    hk = hk + (1 - hk % 2)                                # enforce odd length
+    hk = hk + (1 - hk % 2)
     vert_smooth = np.convolve(vert_proj, np.ones(hk) / hk, mode="same")
 
-    # ── 3. Exclude page-edge margin ───────────────────────────────────────────
+    # Exclude page margins
     margin_px = max(5, int(iw * AUX_MARGIN_FRAC))
-    vert_smooth[:margin_px]   = 0.0
+    vert_smooth[:margin_px]    = 0.0
     vert_smooth[iw-margin_px:] = 0.0
 
-    # ── 4. Collect active x-runs (column candidates) ─────────────────────────
-    ink_floor = ih * 0.005                                 # ≥ 0.5 % of height
+    # Active x-runs
+    ink_floor = ih * 0.005
     active_x  = vert_smooth > ink_floor
 
     x_runs: List[Tuple[int, int]] = []
@@ -549,110 +495,299 @@ def auxiliary_layout_pass(
     if in_run:
         x_runs.append((rx0, iw))
 
-    # ── 5. Merge narrow-gutter fragments ─────────────────────────────────────
+    # Merge micro-gaps (decorative rules, noise)
     min_gutter = max(3, int(iw * AUX_MIN_GUTTER_FRAC))
-    merged_runs: List[List[int]] = []
+    merged: List[List[int]] = []
     for (rx0, rx1) in x_runs:
-        if merged_runs and rx0 - merged_runs[-1][1] <= min_gutter:
-            merged_runs[-1][1] = rx1
+        if merged and rx0 - merged[-1][1] <= min_gutter:
+            merged[-1][1] = rx1
         else:
-            merged_runs.append([rx0, rx1])
+            merged.append([rx0, rx1])
 
     min_col_w = max(MIN_REGION_W, int(iw * AUX_MIN_COL_WIDTH_FRAC))
-    min_col_h = max(MIN_REGION_H, int(ih * AUX_MIN_COL_HEIGHT_FRAC))
-    line_gap  = max(10, int(ih * AUX_LINE_GAP_FRAC))
-    vk        = max(3, int(ih * AUX_VSMOOTH_FRAC))
-    vk        = vk + (1 - vk % 2)
 
-    new_regions: List[Dict] = []
-    pos        = last_position + 1
-    skipped_covered = 0
-    skipped_noink   = 0
-
-    # Pre-compute Surya region x-centres once
+    # Pre-compute Surya x-centres
     surya_cx = [
         (r["bbox"][0] + r["bbox"][2]) / 2.0
         for r in existing_regions
     ]
 
-    for run in merged_runs:
-        bx0, bx1 = run[0], run[1]
-        bw = bx1 - bx0
-        if bw < min_col_w:
+    missed: List[Tuple[int, int]] = []
+    for seg in merged:
+        bx0, bx1 = seg[0], seg[1]
+        if bx1 - bx0 < min_col_w:
             continue
 
-        # ── 6a. Count Surya region centres in this band ───────────────────────
-        centre_count = sum(1 for cx in surya_cx if bx0 <= cx <= bx1)
-
-        if centre_count > AUX_MAX_CENTRE_COUNT:
-            skipped_covered += 1
-            continue                              # Surya already covered this
-
-        # ── 6b. Minimum ink density check ────────────────────────────────────
-        band_ink_total = float(ink[:, bx0:bx1].sum())
-        band_ink_density = band_ink_total / max(1, bw * ih)
-        if band_ink_density < AUX_INK_DENSITY_THRESHOLD:
-            skipped_noink += 1
-            logger.debug(
-                f"    [AUX] band x={bx0}-{bx1} skipped: ink_density="
-                f"{band_ink_density:.4f} < {AUX_INK_DENSITY_THRESHOLD}"
-            )
+        # Ink density check (rejects blank margin artefacts)
+        band_ink   = float(ink[:, bx0:bx1].sum())
+        band_dens  = band_ink / max(1, (bx1 - bx0) * ih)
+        if band_dens < AUX_INK_DENSITY_THRESHOLD:
             continue
 
-        # ── 6c–d. Vertical extent from per-row ink within band ────────────────
-        col_ink    = ink[:, bx0:bx1].sum(axis=1)          # shape (ih,)
-        col_smooth = np.convolve(col_ink, np.ones(vk) / vk, mode="same")
+        # How many Surya regions have their centre inside this band?
+        centres = sum(1 for cx in surya_cx if bx0 <= cx <= bx1)
+        if centres > AUX_MAX_CENTRE_COUNT:
+            continue           # Surya already covered this column
 
-        # Row floor: relative to band width so faint columns still register
-        row_floor = max(0.5, bw * 0.002)
-        active_y  = col_smooth > row_floor
+        missed.append((bx0, bx1))
 
-        y_runs: List[Tuple[int, int]] = []
-        in_y = False; ry0 = 0
-        for y in range(ih):
-            if active_y[y] and not in_y:
-                ry0, in_y = y, True
-            elif not active_y[y] and in_y:
-                y_runs.append((ry0, y))
-                in_y = False
-        if in_y:
-            y_runs.append((ry0, ih))
+    return missed
 
-        # ── 6e. Merge close y-runs ────────────────────────────────────────────
-        merged_y: List[List[int]] = []
-        for (ya, yb) in y_runs:
-            if merged_y and ya - merged_y[-1][1] <= line_gap:
-                merged_y[-1][1] = yb
-            else:
-                merged_y.append([ya, yb])
 
-        # ── 6f. Emit auxiliary regions ────────────────────────────────────────
-        for seg in merged_y:
-            ya, yb = seg
-            if yb - ya < min_col_h:
+def _trocr_read_batch(
+    crops: List[Image.Image],
+    processor: TrOCRProcessor,
+    model: VisionEncoderDecoderModel,
+    batch_size: int = AUX_TROCR_BATCH_SIZE,
+) -> List[Tuple[str, float]]:
+    """
+    Run TrOCR on a list of image crops in batches.
+
+    Returns one (text, confidence) pair per input crop, in the same order.
+    Confidence is the mean max-token probability across all generated tokens.
+    For batched generation the scores tensor shape is
+    (num_steps, batch_size, vocab_size), so per-sequence confidence is read
+    from the correct slice of each step.
+    """
+    if not crops:
+        return []
+
+    results: List[Tuple[str, float]] = []
+    device = next(model.parameters()).device
+
+    for start in range(0, len(crops), batch_size):
+        batch = [c.convert("RGB") for c in crops[start:start + batch_size]]
+        try:
+            pv = processor(batch, return_tensors="pt", padding=True).pixel_values
+            pv = pv.to(device)
+            with torch.no_grad():
+                out = model.generate(
+                    pv,
+                    output_scores=True,
+                    return_dict_in_generate=True,
+                )
+            texts = processor.batch_decode(out.sequences, skip_special_tokens=True)
+            for j, text in enumerate(texts):
+                if out.scores:
+                    # out.scores: tuple of (batch_size, vocab_size) per step
+                    seq_probs = [
+                        torch.max(torch.softmax(out.scores[step][j], dim=-1)).item()
+                        for step in range(len(out.scores))
+                    ]
+                    conf = sum(seq_probs) / max(1, len(seq_probs))
+                else:
+                    conf = 0.5
+                results.append((text.strip(), conf))
+        except Exception as exc:
+            logger.debug(f"    TrOCR batch error (start={start}): {exc}")
+            results.extend([("", 0.0)] * len(batch))
+
+    return results
+
+
+def auxiliary_pass(
+    page_image: Image.Image,
+    existing_regions: List[Dict],
+    last_position: int,
+    det_predictor: DetectionPredictor,
+    trocr_processor: TrOCRProcessor,
+    trocr_model: VisionEncoderDecoderModel,
+) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Efficiently recover text from columns that Surya's LayoutPredictor missed.
+
+    Returns
+    ───────
+    (debug_regions, ocr_elements)
+
+    debug_regions  — lightweight region dicts for visualisation only (amber
+                     boxes in the combined layout debug image).  NOT fed into
+                     the main OCR loop.
+    ocr_elements   — fully formed element dicts ready to merge into all_elements,
+                     identical in structure to those produced by ocr_region().
+
+    Performance design
+    ──────────────────
+    The previous approach created auxiliary "regions" and fed them into the
+    main OCR loop, causing:
+      •  O(aux_regions) DetectionPredictor calls   (one per region, ~2–8s each)
+      •  O(total_lines) sequential TrOCR calls     (one line at a time, ~0.5s each)
+
+    This function instead:
+      1. Calls _find_missed_bands() — pure numpy, < 100 ms
+      2. Runs DetectionPredictor ONCE per missed band (typically 1–4 bands)
+         on a narrow vertical strip rather than the full page
+      3. Collects ALL line crops from ALL missed bands into a single list
+      4. Calls _trocr_read_batch() once — all lines in batches of
+         AUX_TROCR_BATCH_SIZE, amortising the model.generate() overhead
+
+    Total auxiliary DetectionPredictor calls: n_missed_bands (≈ 1–4)
+    Total TrOCR generate() calls:             ceil(n_lines / BATCH_SIZE)
+    """
+    iw, ih = page_image.size
+    min_col_h = max(MIN_REGION_H, int(ih * AUX_MIN_COL_HEIGHT_FRAC))
+    line_gap  = max(10, int(ih * AUX_LINE_GAP_FRAC))
+    vk        = max(3, int(ih * AUX_VSMOOTH_FRAC))
+    vk        = vk + (1 - vk % 2)
+
+    # ── 1. Find which column bands Surya missed ───────────────────────────────
+    missed_bands = _find_missed_bands(page_image, existing_regions)
+
+    if not missed_bands:
+        logger.info("  [AUX] No missed column bands detected.")
+        return [], []
+
+    logger.info(
+        f"  [AUX] {len(missed_bands)} missed band(s): "
+        + "  ".join(f"x={b[0]}-{b[1]}" for b in missed_bands)
+    )
+
+    # ── 2. For each missed band: detect lines, collect crops ──────────────────
+    # We accumulate line crops across ALL bands before calling TrOCR, so all
+    # lines are batched into a single generate() pass.
+    ink       = (np.array(page_image.convert("L"), dtype=np.float32) <
+                 float(np.clip(
+                     np.array(page_image.convert("L"), dtype=np.float32).mean()
+                     - AUX_INK_ADAPTIVE_FACTOR
+                     * np.array(page_image.convert("L"), dtype=np.float32).std(),
+                     50.0, 200.0
+                 ))).astype(np.float32)
+
+    debug_regions: List[Dict] = []
+    # Each entry: (abs_bbox, line_crop, band_x0, position)
+    pending: List[Tuple[List[float], Image.Image, int, int]] = []
+    pos = last_position + 1
+
+    for bx0, bx1 in missed_bands:
+        band_strip = page_image.crop((bx0, 0, bx1, ih))
+
+        # Detect lines within this band strip (one DetectionPredictor call)
+        line_bboxes = _surya_line_bboxes(band_strip, det_predictor)
+
+        if not line_bboxes:
+            # Fall back to vertical-projection segmentation within band
+            col_ink    = ink[:, bx0:bx1].sum(axis=1)
+            col_smooth = np.convolve(col_ink, np.ones(vk) / vk, mode="same")
+            row_floor  = max(0.5, (bx1 - bx0) * 0.002)
+            active_y   = col_smooth > row_floor
+
+            y_segs: List[List[int]] = []
+            in_y = False; ry0 = 0
+            for y in range(ih):
+                if active_y[y] and not in_y:
+                    ry0, in_y = y, True
+                elif not active_y[y] and in_y:
+                    if y - ry0 >= MIN_LINE_H:
+                        y_segs.append([ry0, y])
+                    in_y = False
+            if in_y and ih - ry0 >= MIN_LINE_H:
+                y_segs.append([ry0, ih])
+
+            # Merge close segments
+            merged_y: List[List[int]] = []
+            for seg in y_segs:
+                if merged_y and seg[0] - merged_y[-1][1] <= line_gap:
+                    merged_y[-1][1] = seg[1]
+                else:
+                    merged_y.append(seg)
+
+            for seg in merged_y:
+                ya, yb = seg
+                if yb - ya < min_col_h:
+                    continue
+                abs_bbox = [float(bx0), float(ya), float(bx1), float(yb)]
+                crop     = page_image.crop((bx0, ya, bx1, yb))
+                debug_regions.append({
+                    "bbox": abs_bbox, "polygon": None, "label": "Text",
+                    "position": pos, "top_k": {}, "auxiliary": True,
+                })
+                pending.append((abs_bbox, crop, bx0, pos))
+                pos += 1
+            continue
+
+        # DetectionPredictor found lines — merge close ones into block groups
+        # then treat each group as one "line" sent to TrOCR.
+        # (Sending individual detected lines from a very tall region is the
+        # same as the main pipeline — correct and still faster overall because
+        # we batch across bands.)
+        merged_lines: List[List[float]] = []
+        for lb in sorted(line_bboxes, key=lambda b: b[1]):
+            lx0, ly0, lx1, ly1 = [float(v) for v in lb]
+            lh = ly1 - ly0; lw = lx1 - lx0
+            if lh < MIN_LINE_H or lw < MIN_LINE_W:
                 continue
-            new_regions.append({
-                "bbox":      [float(bx0), float(ya), float(bx1), float(yb)],
+            if merged_lines and ly0 - merged_lines[-1][3] <= line_gap:
+                merged_lines[-1][2] = max(merged_lines[-1][2], lx1)
+                merged_lines[-1][3] = ly1
+            else:
+                merged_lines.append([lx0, ly0, lx1, ly1])
+
+        for ml in merged_lines:
+            lx0, ly0, lx1, ly1 = ml
+            lh = ly1 - ly0; lw = lx1 - lx0
+            if lh < MIN_LINE_H or lw < MIN_LINE_W:
+                continue
+            # Coords are relative to the band strip; translate to page-absolute
+            abs_x0 = bx0 + lx0
+            abs_x1 = min(iw, bx0 + lx1)
+            abs_y0 = max(0, int(ly0))
+            abs_y1 = min(ih, int(ly1))
+            abs_bbox = [float(abs_x0), float(abs_y0), float(abs_x1), float(abs_y1)]
+            crop     = page_image.crop((abs_x0, abs_y0, abs_x1, abs_y1))
+            pending.append((abs_bbox, crop, bx0, pos))
+            pos += 1
+
+        # One debug region per band (for visualisation)
+        all_ys = [lb[1] for lb in line_bboxes] + [lb[3] for lb in line_bboxes]
+        band_y0 = max(0, int(min(all_ys)))
+        band_y1 = min(ih, int(max(all_ys)))
+        if band_y1 > band_y0:
+            debug_regions.append({
+                "bbox":      [float(bx0), float(band_y0), float(bx1), float(band_y1)],
                 "polygon":   None,
                 "label":     "Text",
-                "position":  pos,
+                "position":  last_position + 1 + len(debug_regions),
                 "top_k":     {},
                 "auxiliary": True,
             })
+
+    if not pending:
+        logger.info("  [AUX] No line crops collected from missed bands.")
+        return debug_regions, []
+
+    # ── 3. Batch TrOCR all collected line crops ───────────────────────────────
+    crops_only = [p[1] for p in pending]
+    logger.info(
+        f"  [AUX] Running batched TrOCR on {len(crops_only)} line crop(s) "
+        f"({len(missed_bands)} band(s), batch_size={AUX_TROCR_BATCH_SIZE}) …"
+    )
+    batch_results = _trocr_read_batch(crops_only, trocr_processor, trocr_model)
+
+    # ── 4. Filter noise and build element dicts ───────────────────────────────
+    ocr_elements: List[Dict] = []
+    accepted = 0
+    for (abs_bbox, _crop, _bx0, elem_pos), (text, conf) in zip(pending, batch_results):
+        x0, y0, x1, y1 = abs_bbox
+        lh = int(y1 - y0); lw = int(x1 - x0)
+        if _is_noise(text, conf, lh, lw):
             logger.debug(
-                f"    [AUX] +region: x={bx0}-{bx1} y={ya}-{yb}  "
-                f"centres={centre_count}  ink_density={band_ink_density:.4f}"
+                f"    [AUX NOISE] conf={conf:.2f} {lw}×{lh}px | {text[:40]}"
             )
-            pos += 1
+            continue
+        ocr_elements.append({
+            "text":             text,
+            "bbox":             abs_bbox,
+            "confidence":       conf,
+            "font_size":        max(6.0, min(lh * 0.85, 72.0)),
+            "source_label":     "Text",
+            "reading_position": elem_pos,
+            "auxiliary":        True,
+        })
+        accepted += 1
 
     logger.info(
-        f"  [AUX-LAYOUT] {len(new_regions)} auxiliary Text region(s) added.  "
-        f"(ink_threshold={threshold:.0f}  hk={hk}px  "
-        f"col_w≥{min_col_w}px  col_h≥{min_col_h}px  "
-        f"max_centres≤{AUX_MAX_CENTRE_COUNT}  "
-        f"skipped: covered={skipped_covered}  low-ink={skipped_noink})"
+        f"  [AUX] {accepted}/{len(pending)} auxiliary line(s) accepted after noise filter."
     )
-    return new_regions
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -994,9 +1129,9 @@ def process_page(
 
     1. Preprocess  — tiled CLAHE-approx + unsharp mask
     2. Layout      — LayoutPredictor → semantic regions
-    3. Aux Layout  — auxiliary_layout_pass() → fills gaps in Surya output
-    4. OCR         — DetectionPredictor (line segmentation) + TrOCR per line
-    5. Sort        — by reading_position, then vertical baseline
+    3. Aux pass    — auxiliary_pass() → band detection + batched TrOCR for missed columns
+    4. OCR         — DetectionPredictor (line segmentation) + TrOCR per line (Surya regions)
+    5. Sort        — merge aux elements, sort by reading_position then vertical baseline
 
     Returns a flat list of element dicts in reading order.
     """
@@ -1054,42 +1189,46 @@ def process_page(
             filename, page_num, label="SURYA",
         )
 
-    # ── Stage 3: Auxiliary layout pass ───────────────────────────────────────
-    # Skip the auxiliary pass if we are already using the whole-page fallback
-    # (nothing meaningful to gap-fill in that case).
-    aux_regions: List[Dict] = []
+    # ── Stage 3: Auxiliary pass (band detection + batched OCR) ───────────────
+    # Skip when using the whole-page fallback — nothing meaningful to gap-fill.
+    aux_debug_regions: List[Dict] = []
+    aux_elements:      List[Dict] = []
+
     if not fallback_used:
-        logger.info("  [AUX-LAYOUT] Running auxiliary column-recovery pass …")
+        logger.info("  [AUX] Running auxiliary column-recovery pass …")
         try:
-            last_pos    = max((r["position"] for r in layout_regions), default=0)
-            aux_regions = auxiliary_layout_pass(processed, layout_regions, last_pos)
+            last_pos = max((r["position"] for r in layout_regions), default=0)
+            aux_debug_regions, aux_elements = auxiliary_pass(
+                processed, layout_regions, last_pos,
+                det_predictor, trocr_processor, trocr_model,
+            )
         except Exception as exc:
-            logger.error(f"  auxiliary_layout_pass failed: {exc}")
+            logger.error(f"  auxiliary_pass failed: {exc}")
             import traceback; traceback.print_exc()
 
-        if aux_regions:
-            combined_regions = layout_regions + aux_regions
+        if aux_debug_regions:
+            combined_vis = layout_regions + aux_debug_regions
             save_layout_debug(
-                pil_image, combined_regions,
+                pil_image, combined_vis,
                 Path(str(pfx) + "_01b_layout_combined.jpg"),
                 title_suffix=" (Surya + Auxiliary)",
             )
             save_layout_report(
-                combined_regions, image_bbox,
+                combined_vis, image_bbox,
                 Path(str(pfx) + "_01b_layout_combined_report.txt"),
                 filename, page_num, label="COMBINED",
             )
         else:
-            logger.info("  [AUX-LAYOUT] No additional regions found.")
-            combined_regions = layout_regions
-    else:
-        combined_regions = layout_regions
+            logger.info("  [AUX] No missed columns detected.")
 
-    # ── Stage 4: Per-region OCR ───────────────────────────────────────────────
-    text_regions    = [r for r in combined_regions if r["label"] in OCR_LABELS]
-    skip_regions    = [r for r in combined_regions if r["label"] in SKIP_LABELS]
+    # ── Stage 4: Per-region OCR (Surya regions only) ─────────────────────────
+    # Auxiliary elements are produced directly by auxiliary_pass() and are
+    # merged into all_elements after this loop — they do NOT go through
+    # ocr_region(), which would repeat detection and sequential TrOCR on them.
+    text_regions    = [r for r in layout_regions if r["label"] in OCR_LABELS]
+    skip_regions    = [r for r in layout_regions if r["label"] in SKIP_LABELS]
     unknown_regions = [
-        r for r in combined_regions
+        r for r in layout_regions
         if r["label"] not in OCR_LABELS and r["label"] not in SKIP_LABELS
     ]
     if unknown_regions:
@@ -1099,12 +1238,9 @@ def process_page(
             f"label(s) {unk_lbls} — skipping OCR for these."
         )
 
-    surya_ocr_n = sum(1 for r in text_regions if not r.get("auxiliary", False))
-    aux_ocr_n   = sum(1 for r in text_regions if r.get("auxiliary", False))
     logger.info(
-        f"  [OCR] {len(text_regions)} regions to OCR "
-        f"(Surya: {surya_ocr_n}  Auxiliary: {aux_ocr_n}  "
-        f"TrOCR model: {TROCR_MODEL_NAME}), "
+        f"  [OCR] {len(text_regions)} Surya regions to OCR "
+        f"(TrOCR model: {TROCR_MODEL_NAME}), "
         f"{len(skip_regions)} region(s) skipped."
     )
 
@@ -1126,11 +1262,12 @@ def process_page(
         logger.debug(f"      → {len(elems)} element(s) accepted.")
         all_elements.extend(elems)
 
-    # ── Stage 5: Final reading order sort ────────────────────────────────────
+    # ── Stage 5: Merge auxiliary elements + final reading order sort ─────────
+    all_elements.extend(aux_elements)
     all_elements.sort(key=lambda e: (e["reading_position"], e["bbox"][1]))
 
     surya_elem_n = sum(1 for e in all_elements if not e.get("auxiliary", False))
-    aux_elem_n   = sum(1 for e in all_elements if e.get("auxiliary", False))
+    aux_elem_n   = len(aux_elements)
     logger.info(
         f"  [RESULT] {len(all_elements)} OCR element(s) on page {page_num} "
         f"(Surya: {surya_elem_n}  Auxiliary: {aux_elem_n})."
