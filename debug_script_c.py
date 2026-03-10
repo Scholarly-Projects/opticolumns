@@ -49,7 +49,7 @@ TROCR_MODELS = {
     "large_handwritten": "microsoft/trocr-large-handwritten",
     "large_printed":     "microsoft/trocr-large-printed",
 }
-TROCR_MODEL_NAME = TROCR_MODELS["large_printed"]
+TROCR_MODEL_NAME = TROCR_MODELS["large_handwritten"]
 
 # ── TrOCR noise-filter thresholds ────────────────────────────────────────────
 # TrOCR does not expose per-token probabilities in the same way as Surya;
