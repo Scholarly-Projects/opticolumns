@@ -29,7 +29,14 @@ pip install -r requirements.txt
 
 brew install poppler
 
-# Run
+# Run your scripts
 
 python script.py
+or avoid idle sleep
+caffeinate -i python script.py
+or avoid display sleep
+caffeinate -di python script.py
+and
 python review.py
+or 
+python report.py
