@@ -1,36 +1,6 @@
 #!/usr/bin/env python3
 """
 Opticolumns  –  debug_script_e.py
-======================================================================
-Changes from previous revision (debug_script_d.py) — recall fixes:
-  - Label handling      : Table / Form are now OCR'd; SKIP_LABELS is only
-                          Picture / Figure.  Any label NOT in SKIP_LABELS is
-                          read (default-to-OCR), so an unrecognised label can
-                          no longer silently drop content.  _normalise_label()
-                          is now case / underscore-insensitive.
-  - _nms_regions        : Only suppresses same-label duplicates (a Picture box
-                          can no longer swallow an overlapping Text box).
-  - _trocr_read         : max_new_tokens=MAX_NEW_TOKENS so long lines are not
-                          truncated by the checkpoint's default length.
-  - _is_noise           : No longer rejects numerals (prices, dates, phone
-                          numbers), vowel-less non-alphabetic strings, or wide
-                          banner lines (aspect cap 100 → 400); accepts a
-                          per-call min_conf.
-  - ocr_region          : Pass 1 vs Pass 2 winner chosen by accepted characters
-                          rather than line count.
-  - sweep_uncovered_text: NEW recall safety-net.  Tiles the page, detects text
-                          lines, and OCRs any line no layout region claimed.
-                          Recovered lines are labelled "Recovered" (yellow in
-                          the overlay).
-  - process_page        : Default-to-OCR region selection; calls the sweep.
-
-Changes — debug output:
-  - _debug_img_path()   : NEW.  With DEBUG_OVERWRITE_IMAGES = True every page
-                          overwrites the same three debug JPEGs
-                          (latest_*.jpg), so large batches don't bloat the
-                          debug folder.
-  - clear_debug_images(): NEW.  Removes stale JPEGs from earlier runs.
-======================================================================
 """
 
 import sys

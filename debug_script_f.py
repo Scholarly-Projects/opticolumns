@@ -78,6 +78,9 @@ CONFIDENCE_THRESHOLD             = 0.25   # minimum mean token confidence
 SINGLE_CHAR_CONFIDENCE_THRESHOLD = 0.50   # tighter threshold for 1-char results
 MIN_LINE_H                       = 8      # px — skip lines shorter than this
 MIN_LINE_W                       = 15     # px — skip lines narrower than this
+SPARSE_LINE_WIDTH_RATIO          = 2.0    # width / (height * char count) above this
+                                           # is treated as a hallucinated short guess
+                                           # for a mostly-blank or non-textual strip
 
 # TrOCR generation cap (tokens).  Without an explicit cap, long column lines can
 # be truncated by the checkpoint's default generation length.
@@ -111,6 +114,29 @@ COLUMN_GAP_MIN           = 150    # px; an x-gap at least this wide between clai
 # part of the page.
 MIN_UNCLAIMED_COLUMN_LINES        = 5      # fewer recovered lines than this are not relocated
 MIN_UNCLAIMED_COLUMN_HEIGHT_FRAC  = 0.25   # cluster must span at least this fraction of the page height
+
+# Same-position elements are grouped into a visual row only if consecutive
+# lines' boxes overlap by more than this fraction of the smaller line's
+# height, AND their x-overlap is below ROW_MAX_X_OVERLAP (genuinely side by
+# side, not stacked) -- see _assign_visual_rows.
+ROW_OVERLAP_FRACTION = 0.5
+ROW_MAX_X_OVERLAP    = 0.5
+
+# ── Banner/masthead reading-order correction ──────────────────────────────────
+# Surya's LayoutPredictor position is documented as a column-aware reading
+# order index, and in practice keeps each column's own regions together and
+# in order -- but a masthead or banner headline doesn't belong to any single
+# column, and its position can occasionally land it mid-column instead of
+# with the rest of the masthead. _reorder_banner_regions() finds the page's
+# shared top masthead band and re-anchors only the members whose position
+# doesn't already sort before the body; everything else, including every
+# column's own Section-header, is left as Surya provided it.
+BANNER_BAND_OVERLAP_THRESHOLD = 0.18   # y-range overlap (as a fraction of the narrower
+                                        # region's height) required to count as one band
+BANNER_BAND_MIN_GAP_PX        = max(10, round(DPI * 0.06))  # px gap still counted as
+                                                              # the same band (scales with DPI)
+                                       # to resolve, instead of being repositioned next to it
+                                       # (see the in-loop comment in _reorder_banner_regions)
 
 # Padding (px) added to each existing element's box when the sweep checks
 # whether a newly detected line is already covered — absorbs the few-pixel
@@ -189,10 +215,6 @@ FURNITURE_LABELS = HEADER_LABELS | {"Page-footer", "Table-of-contents"}
 # Two elements are treated as duplicate reads of the same physical content if
 # the smaller one's area overlaps the larger by at least this fraction...
 DEDUPE_CONTAINMENT = 0.5
-# ...and only if their reading positions differ by at least this much (lines
-# of the same or an immediately neighbouring region share or nearly share one
-# position and must never be flagged).
-DEDUPE_MIN_POSITION_GAP = 1.5
 # ...and only if the two elements' areas are reasonably comparable.  A tiny
 # fragment (a stray edge sliver, a single stray character) can sit almost
 # entirely inside a large, legitimate line's box, giving near-100% overlap
@@ -808,6 +830,144 @@ def _nms_regions(regions: List[Dict], iou_threshold: float = 0.45) -> List[Dict]
     return kept
 
 
+def _band_merge_test(lo: float, hi: float, glo: float, ghi: float,
+                      overlap_threshold: float, min_gap: float) -> bool:
+    """
+    True if the interval [lo,hi] belongs in the same band as [glo,ghi]:
+    either they overlap by more than `overlap_threshold` of the narrower
+    interval's length, or they don't overlap but the gap between them is
+    smaller than `min_gap` (too small to trust as a real separation — a
+    couple of pixels of detector jitter, not a genuine masthead/body gap).
+    """
+    overlap_val = min(hi, ghi) - max(lo, glo)
+    if overlap_val > 0:
+        narrower = min(hi - lo, ghi - glo)
+        return (overlap_val / narrower) > overlap_threshold if narrower > 0 else False
+    return (-overlap_val) < min_gap
+
+
+def _group_by_y_band(
+    regions: List[Dict],
+    overlap_threshold: float = BANNER_BAND_OVERLAP_THRESHOLD,
+    min_gap: float = BANNER_BAND_MIN_GAP_PX,
+) -> List[Tuple[float, float, List[Dict]]]:
+    """
+    Single-linkage clustering of `regions` into horizontal y-bands.
+
+    Two regions land in the same band if their y-ranges overlap by more than
+    `overlap_threshold` of the narrower one's height, or are separated by
+    less than `min_gap` px. A genuine masthead/body gap runs to hundreds of
+    px on a real scan -- far larger than either threshold -- so this
+    reliably separates a shared top band (a masthead, spanning many
+    x-positions) from the tall band of column-body content below it.
+
+    Returns [(band_y0, band_y1, [region, ...]), ...] sorted top to bottom.
+    """
+    items = sorted(regions, key=lambda r: r["bbox"][1])
+    groups: List[List] = []
+    for r in items:
+        y0, y1 = r["bbox"][1], r["bbox"][3]
+        placed = False
+        for g in groups:
+            if _band_merge_test(y0, y1, g[0], g[1], overlap_threshold, min_gap):
+                g[0] = min(g[0], y0); g[1] = max(g[1], y1); g[2].append(r)
+                placed = True
+                break
+        if not placed:
+            groups.append([y0, y1, [r]])
+
+    # Cleanup pass: a region processed out of y0 order can retroactively
+    # bridge two groups that were formed before it was seen. Repeat until
+    # no further merges happen.
+    changed = True
+    while changed and len(groups) > 1:
+        changed = False
+        groups.sort(key=lambda g: g[0])
+        merged = [groups[0]]
+        for g in groups[1:]:
+            last = merged[-1]
+            if _band_merge_test(g[0], g[1], last[0], last[1], overlap_threshold, min_gap):
+                last[0] = min(last[0], g[0]); last[1] = max(last[1], g[1]); last[2].extend(g[2])
+                changed = True
+            else:
+                merged.append(g)
+        groups = merged
+
+    groups.sort(key=lambda g: g[0])
+    return [(g[0], g[1], g[2]) for g in groups]
+
+
+def _reorder_banner_regions(layout_regions: List[Dict]) -> None:
+    """
+    Correct Surya's own `position` for masthead/banner regions it
+    occasionally mis-scores (see the BANNER_BAND_* constants above).
+
+    Finds the page's shared top masthead band via _group_by_y_band() (the
+    band sitting entirely above the widest band, the main body of column
+    content), then re-anchors only the masthead-band members whose position
+    doesn't already sort before the body. Every other region -- including
+    every column's own Section-header -- is left exactly as Surya gave it.
+    Mutates `position` in place on the affected region dicts.
+    """
+    if len(layout_regions) < 2:
+        return
+
+    bands = _group_by_y_band(layout_regions)
+    if len(bands) < 2:
+        return   # everything is one block -- nothing to separate out
+
+    body_y0, body_y1, body_members = max(bands, key=lambda b: len(b[2]))
+
+    banner_members: List[Dict] = []
+    for y0, y1, members in bands:
+        if members is body_members:
+            continue
+        # A band counts as masthead only if it sits entirely above the body
+        # band AND contains at least one header-type region -- any(), not
+        # all(), because Surya's label for a borderline region can flip
+        # between runs, and the geometric isolation test is already the
+        # load-bearing signal.
+        if y1 <= body_y0 and any(r["label"] in HEADER_LABELS for r in members):
+            banner_members.extend(members)
+
+    if not banner_members:
+        return
+
+    floor = min(r["position"] for r in body_members)
+    correctly_placed = [r for r in banner_members if r["position"] < floor]
+    misplaced        = [r for r in banner_members if r["position"] >= floor]
+    if not misplaced:
+        return   # Surya already placed every masthead region before the body
+
+    if not correctly_placed:
+        # No already-correct masthead region to anchor against -- order the
+        # whole masthead band by x0 instead, still strictly before the body.
+        for i, r in enumerate(sorted(banner_members, key=lambda r: r["bbox"][0])):
+            old = r["position"]
+            r["position"] = floor - len(banner_members) + i
+            logger.info(
+                f"  [ORDER] moved {r['label']} bbox=({r['bbox'][0]:.0f},{r['bbox'][1]:.0f}"
+                f"→{r['bbox'][2]:.0f},{r['bbox'][3]:.0f}) from position {old} to "
+                f"{r['position']} (top masthead band, x0 order)."
+            )
+        return
+
+    for r in misplaced:
+        cx = (r["bbox"][0] + r["bbox"][2]) / 2
+        nearest = min(
+            correctly_placed,
+            key=lambda c: abs((c["bbox"][0] + c["bbox"][2]) / 2 - cx),
+        )
+        old = r["position"]
+        r["position"] = nearest["position"] + 0.5
+        logger.info(
+            f"  [ORDER] moved {r['label']} bbox=({r['bbox'][0]:.0f},{r['bbox'][1]:.0f}"
+            f"→{r['bbox'][2]:.0f},{r['bbox'][3]:.0f}) from position {old} to "
+            f"{r['position']} -- belongs in the top masthead band beside the "
+            f"nearest masthead piece (pos={nearest['position']}), not the column flow."
+        )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # LAYOUT PARSING
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1087,6 +1247,13 @@ def _is_noise(
     if (tl > 3 and tc.isalpha()
             and not any(c in "aeiouy" for c in tc.lower())
             and confidence < 0.7):
+        return True
+    # A box far wider than its own recognized text would need at that
+    # height is usually a mostly-blank or non-textual strip that TrOCR has
+    # filled in with a short, plausible-looking guess rather than genuinely
+    # read. Only checked for tl >= 4: shorter strings make this ratio too
+    # noisy to trust (a single wide digit or punctuation mark is normal).
+    if tl >= 4 and (w / (h * tl)) > SPARSE_LINE_WIDTH_RATIO:
         return True
     return False
 
@@ -1423,29 +1590,38 @@ def _assign_visual_rows(elements: List[Dict]) -> None:
     Give every element a "_row" index (mutates in place) for the final sort.
 
     Elements sharing a reading position are grouped into visual rows by
-    y-OVERLAP, not by matching y0 exactly: two fragments genuinely on the
-    same printed line rarely share an identical y0 — a few pixels of natural
-    per-box variation between separately detected fragments is ordinary
-    (confirmed on a real two-word banner headline, "DOUBLE" at y0=1109 and
-    "DEBATE" at y0=1105) — so sorting straight on y0 can flip same-row
-    fragments out of left-to-right order before an x tiebreaker is ever
-    consulted.  Within a reading position, elements are walked top-to-bottom;
-    an element starts a new row only once its y0 reaches or passes the
-    bottom of every element already placed in the current row.
+    comparing each line only to the immediately preceding one (sorted
+    top-to-bottom), never an accumulated row boundary -- that would let a
+    chain of small overlaps merge an entire column into one row. Two lines
+    count as the same row only if they overlap substantially in y (more
+    than ROW_OVERLAP_FRACTION of the smaller line's height) AND sit mostly
+    side by side rather than stacked (x-overlap under ROW_MAX_X_OVERLAP).
+    The x condition is what separates genuine same-line fragments (two
+    headline words, occupying different x-ranges) from stacked lines with
+    messy, overlapping detection boxes (near-identical x-range, moderate
+    y-overlap) that would otherwise get sorted left-to-right instead of
+    top-to-bottom.
     """
     groups: Dict[float, List[Dict]] = {}
     for e in elements:
         groups.setdefault(e["reading_position"], []).append(e)
     for group in groups.values():
         group.sort(key=lambda e: e["bbox"][1])
-        row, row_bottom = 0, None
+        row = 0
+        prev_box: Optional[List[float]] = None
         for e in group:
-            y0, y1 = e["bbox"][1], e["bbox"][3]
-            if row_bottom is not None and y0 >= row_bottom:
-                row += 1
-                row_bottom = y1
-            else:
-                row_bottom = max(row_bottom, y1) if row_bottom is not None else y1
+            x0, y0, x1, y1 = e["bbox"]
+            if prev_box is not None:
+                px0, py0, px1, py1 = prev_box
+                y_overlap = min(y1, py1) - max(y0, py0)
+                smaller_h = min(y1 - y0, py1 - py0)
+                y_same = smaller_h > 0 and (y_overlap / smaller_h) > ROW_OVERLAP_FRACTION
+                x_overlap = min(x1, px1) - max(x0, px0)
+                smaller_w = min(x1 - x0, px1 - px0)
+                x_side_by_side = smaller_w <= 0 or (x_overlap / smaller_w) < ROW_MAX_X_OVERLAP
+                if not (y_same and x_side_by_side):
+                    row += 1
+            prev_box = [x0, y0, x1, y1]
             e["_row"] = row
 
 
@@ -1459,37 +1635,27 @@ def _overlap_area(a: List[float], b: List[float]) -> float:
 def dedupe_overlapping_elements(elements: List[Dict]) -> List[Dict]:
     """
     Remove an element that is a duplicate re-read of another element's
-    physical area, at a different reading position.
+    physical area.
 
-    This happens when Surya's own layout stage emits two overlapping regions
-    for the same content under different labels — same-label duplicates are
-    already merged by _nms_regions() before OCR, but a CROSS-label duplicate
-    (e.g. a masthead dateline correctly boxed as Page-header, and separately,
-    erroneously, boxed again as Text over almost the same pixels) survives
-    that pass, because NMS there only merges regions sharing a label — a
-    deliberate choice so a Picture region can never suppress a genuinely
-    different Text region overlapping it (see _nms_regions).  Both
-    overlapping regions then reach OCR, so the same text is inserted twice:
-    once at its correct reading position, and once wherever Surya's layout
-    stage happened to place the extra region — which can be far from where
-    the content visually sits, reading as if the transcript jumps to an
-    unrelated part of the page.  Confirmed on a real page: one region read
-    "UNIVERSITY OF IDAHO, MOSCOW, WEDNESDAY," a second time, correctly, but
-    at a reading position 15 slots later than the (garbled) first read.
+    This happens when Surya's own layout or line-detection stage emits two
+    overlapping boxes for the same content -- e.g. two overlapping regions
+    under different labels (same-label duplicates are already merged by
+    _nms_regions before OCR), or two overlapping lines detected within one
+    region's multi-line pass. Both get OCR'd, so the same text is inserted
+    twice.
 
-    Only pairs whose reading positions differ by more than
-    DEDUPE_MIN_POSITION_GAP are compared, so adjacent lines of the same or an
-    immediately neighbouring region (which share or nearly share one
-    position) are never flagged.  A pair must also have comparable AREAS
-    (DEDUPE_MAX_AREA_RATIO) — a tiny stray fragment can sit almost entirely
-    inside a large legitimate line's box (near-100% overlap relative to the
-    fragment's own tiny area) without being a second read of that line; two
-    genuine duplicate reads of the same content are much closer in size.  Of
-    a genuinely duplicate pair: if exactly one element's label is a "page
-    furniture" type (FURNITURE_LABELS — mastheads, datelines, headlines,
-    footers), it is kept and the other dropped (see FURNITURE_LABELS for
-    why).  Otherwise the lower-confidence
-    read is dropped.
+    A pair counts as a duplicate if one box is contained in the other by
+    more than DEDUPE_CONTAINMENT of its own area, and the two areas are
+    comparable (DEDUPE_MAX_AREA_RATIO) -- a tiny stray fragment can sit
+    almost entirely inside a large legitimate line's box without being a
+    second read of it, but two genuine duplicate reads are close in size.
+    Containment is checked regardless of reading position: genuinely
+    different sequential lines never reach this containment level in
+    practice (a descender's overlap is a small fraction of a line's area),
+    so position is not a useful signal here. Of a genuinely duplicate pair:
+    if exactly one element's label is a "page furniture" type
+    (FURNITURE_LABELS), it is kept and the other dropped; otherwise the
+    lower-confidence read is dropped.
     """
     if len(elements) < 2:
         return elements
@@ -1509,8 +1675,6 @@ def dedupe_overlapping_elements(elements: List[Dict]) -> List[Dict]:
             b = elements[j]
             if b["bbox"][1] > ay1:      # sorted by y0 -- nothing further below can still overlap 'a'
                 break
-            if abs(a["reading_position"] - b["reading_position"]) < DEDUPE_MIN_POSITION_GAP:
-                continue
             area_b  = max(1.0, (b["bbox"][2] - b["bbox"][0]) * (b["bbox"][3] - b["bbox"][1]))
             overlap = _overlap_area(a["bbox"], b["bbox"])
             if overlap / min(area_a, area_b) < DEDUPE_CONTAINMENT:
@@ -1539,9 +1703,43 @@ def dedupe_overlapping_elements(elements: List[Dict]) -> List[Dict]:
     if n_dropped:
         logger.info(
             f"  [DEDUPE] removed {n_dropped} duplicate element(s) "
-            f"(same content recognised twice at different reading positions)."
+            f"(same content recognised twice)."
         )
     return [e for k, e in enumerate(elements) if not dropped[k]]
+
+
+def _split_wide_sweep_line(box: List[float], bands: List[List[float]]) -> List[List[float]]:
+    """
+    If `box` [x0,y0,x1,y1] straddles a known column-band edge, split it into
+    per-band pieces at that edge. Returns [box] unchanged when no band edge
+    falls strictly inside it -- true for every ordinary single-column line
+    -- so this is safe to call unconditionally.
+
+    Why this exists: sweep_uncovered_text()'s DetectionPredictor pass runs
+    on a raw, unconfined tile crop -- nothing tells it where one column ends
+    and the next begins, unlike the per-region OCR pass. On degraded
+    newsprint it can bridge a narrow or layout-missed gutter and return one
+    "line" spanning two adjacent columns' text, producing a single element
+    whose text fuses two unrelated sentences with no boundary between them.
+    `bands` only carries the column edges _column_bands() established, so
+    this can't split a line inside a run of columns _column_bands already
+    merged into one band (e.g. when several real gutters are narrower than
+    COLUMN_GAP_MIN).
+    """
+    x0, y0, x1, y1 = box
+    cuts = sorted(set(
+        round(c) for c in
+        [b[0] for b in bands if x0 < b[0] < x1] +
+        [b[1] for b in bands if x0 < b[1] < x1]
+    ))
+    if not cuts:
+        return [box]
+    edges = [x0] + cuts + [x1]
+    return [
+        [edges[i], y0, edges[i + 1], y1]
+        for i in range(len(edges) - 1)
+        if edges[i + 1] - edges[i] >= MIN_LINE_W
+    ]
 
 
 def sweep_uncovered_text(
@@ -1577,6 +1775,10 @@ def sweep_uncovered_text(
       MIN_UNCLAIMED_COLUMN_HEIGHT_FRAC) — everything else keeps this
       nearest-neighbour position, never landing far from where it visually
       sits on the page.
+    - A detected line that straddles a known column-band edge is split
+      there (_split_wide_sweep_line) before coverage-checking or OCR, each
+      piece read independently -- otherwise the raw tile detector can fuse
+      two columns' text into one box with no boundary between them.
 
     Coordinates are in the same space as `page_image` (full-page pixels).
     """
@@ -1584,6 +1786,7 @@ def sweep_uncovered_text(
     m      = SWEEP_EDGE_MARGIN
     recovered: List[Dict] = []
     known: List[Dict]     = list(elements)
+    column_bands = _column_bands(layout_regions, iw)
 
     for ty in _tile_origins(ih, SWEEP_TILE, SWEEP_OVERLAP):
         for tx in _tile_origins(iw, SWEEP_TILE, SWEEP_OVERLAP):
@@ -1597,27 +1800,31 @@ def sweep_uncovered_text(
                 lh, lw = ly1 - ly0, lx1 - lx0
                 if lh < MIN_LINE_H or lw < MIN_LINE_W:
                     continue
-                box = [lx0 + tx, ly0 + ty, lx1 + tx, ly1 + ty]
-                if _coverage(box, known, pad=SWEEP_COVERAGE_PAD) >= SWEEP_COVERED_FRAC:
-                    continue
-                line = page_image.crop(tuple(int(v) for v in box))
-                text, conf = _trocr_read(line, trocr_processor, trocr_model)
-                if _is_noise(text, conf, int(lh), int(lw), min_conf=SWEEP_MIN_CONFIDENCE):
-                    logger.debug(
-                        f"      [SWEEP-NOISE] conf={conf:.2f} "
-                        f"{int(lw)}×{int(lh)}px | {text[:40]}"
-                    )
-                    continue
-                elem = {
-                    "text":             text,
-                    "bbox":             box,
-                    "confidence":       conf,
-                    "font_size":        max(6.0, min(lh * 0.85, 72.0)),
-                    "source_label":     "Recovered",
-                    "reading_position": _nearest_position(box, layout_regions),
-                }
-                recovered.append(elem)
-                known.append(elem)
+                raw_box = [lx0 + tx, ly0 + ty, lx1 + tx, ly1 + ty]
+                for box in _split_wide_sweep_line(raw_box, column_bands):
+                    bw, bh = box[2] - box[0], box[3] - box[1]
+                    if bw < MIN_LINE_W:
+                        continue
+                    if _coverage(box, known, pad=SWEEP_COVERAGE_PAD) >= SWEEP_COVERED_FRAC:
+                        continue
+                    line = page_image.crop(tuple(int(v) for v in box))
+                    text, conf = _trocr_read(line, trocr_processor, trocr_model)
+                    if _is_noise(text, conf, int(bh), int(bw), min_conf=SWEEP_MIN_CONFIDENCE):
+                        logger.debug(
+                            f"      [SWEEP-NOISE] conf={conf:.2f} "
+                            f"{int(bw)}×{int(bh)}px | {text[:40]}"
+                        )
+                        continue
+                    elem = {
+                        "text":             text,
+                        "bbox":             box,
+                        "confidence":       conf,
+                        "font_size":        max(6.0, min(bh * 0.85, 72.0)),
+                        "source_label":     "Recovered",
+                        "reading_position": _nearest_position(box, layout_regions),
+                    }
+                    recovered.append(elem)
+                    known.append(elem)
 
     moved = _assign_recovered_positions(recovered, layout_regions, iw, ih)
     if moved:
@@ -1831,6 +2038,8 @@ def process_page(
 
     1.  Preprocess  — tiled CLAHE-approx + unsharp mask
     2.  Layout      — LayoutPredictor → semantic regions + reading order positions
+    2b. Reorder     — correct Surya's own position for masthead/banner regions
+                      it occasionally mis-scores (see _reorder_banner_regions)
     3.  OCR         — DetectionPredictor (line segmentation) + TrOCR per line,
                       for every region not in SKIP_LABELS
     3b. Sweep       — tile the page, OCR any detected line no region claimed;
@@ -1895,6 +2104,12 @@ def process_page(
         save_layout_report(layout_regions, image_bbox,
                            _debug_path(stem, page_num, "01_layout_report", "txt"),
                            filename, page_num)
+
+        # Stage 2b: correct Surya's position for misplaced masthead/banner
+        # regions before anything downstream trusts it (see
+        # _reorder_banner_regions). Debug artefacts above show Surya's raw
+        # positions; [ORDER] log lines report what this step changed.
+        _reorder_banner_regions(layout_regions)
 
     # ── Stage 3: Per-region DetectionPredictor + TrOCR ────────────────────────
     # Default-to-OCR: anything not explicitly in SKIP_LABELS is read, so a label
