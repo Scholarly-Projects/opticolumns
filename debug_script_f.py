@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+"""
+Opticolumns  –  debug_script_f.py
+======================================================================
+Base: debug_script_e.py (Surya layout + TrOCR recognition, recall sweep,
+      rolling debug images).  Pipeline/OCR logic is unchanged.
+
+======================================================================
+"""
 
 import sys
 import os
@@ -20,7 +28,7 @@ try:
 except ImportError:             # older PyMuPDF releases
     import fitz
 import pikepdf
-from PIL import Image, ImageCms, ImageDraw, ImageFilter, ImageFont, ImageOps
+from PIL import Image, ImageChops, ImageCms, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 from surya.detection import DetectionPredictor
 from surya.foundation import FoundationPredictor
@@ -80,17 +88,52 @@ MAX_NEW_TOKENS = 192
 # line that is not already covered by an existing element is OCR'd and added.
 SWEEP_ENABLED        = True
 SWEEP_TILE           = 1920   # px per tile side (300 DPI ≈ 6.4 in)
-SWEEP_OVERLAP        = 640    # px; must exceed the longest line the sweep should recover
+SWEEP_OVERLAP        = 960    # px; must exceed the longest line the sweep should recover
+                              # (broadsheet columns at 300 DPI run up to ~715 px)
 SWEEP_EDGE_MARGIN    = 6      # px; boxes touching an interior tile edge are ignored
 SWEEP_COVERED_FRAC   = 0.50   # candidate counts as "already read" above this overlap
 SWEEP_MIN_CONFIDENCE = 0.40   # stricter than CONFIDENCE_THRESHOLD: sweep also sees photos
 
-# ── Debug images ──────────────────────────────────────────────────────────────
-# True  → one rolling set of debug JPEGs (latest_*.jpg), overwritten by every
-#         page, so the debug folder does not grow with batch size.
-# False → separate JPEGs for every file/page.
-# Text reports (.txt) are always kept per page (they are tiny).
-DEBUG_OVERWRITE_IMAGES = True
+# ── Column bands (give recovered lines a sensible reading position) ──────────
+# Every non-page-wide layout region, of any height, claims its own x-range as
+# a "column body" — see _column_bands().  A run of recovered lines centred in
+# a genuinely unclaimed x-gap (a whole column the layout model skipped) is
+# slotted into reading order between the columns on either side of it,
+# instead of being attached to a neighbour.
+COLUMN_REGION_MAX_W_FRAC = 0.40   # regions wider than this share of the page (mastheads) are ignored
+COLUMN_GAP_MIN           = 150    # px; an x-gap at least this wide between claimed bands = unclaimed column
+
+# A cluster of recovered lines in an unclaimed gap is only treated as a whole
+# missed column (and relocated in reading order) if it clears BOTH of these —
+# a handful of stray lines (a coverage false-negative, a marginal duplicate)
+# stays at its original nearest-neighbour position instead, which is always
+# at worst a harmless local duplicate rather than being moved to an unrelated
+# part of the page.
+MIN_UNCLAIMED_COLUMN_LINES        = 5      # fewer recovered lines than this are not relocated
+MIN_UNCLAIMED_COLUMN_HEIGHT_FRAC  = 0.25   # cluster must span at least this fraction of the page height
+
+# Padding (px) added to each existing element's box when the sweep checks
+# whether a newly detected line is already covered — absorbs the few-pixel
+# boundary disagreement two independent detector passes over different crops
+# of the same physical line can produce, so it isn't mistaken for new content.
+SWEEP_COVERAGE_PAD = 6
+
+# ── Coverage audit (diagnostic; never changes the output) ────────────────────
+# After OCR + sweep, measure how much printed ink still lies outside every OCR'd
+# box.  Logs the share, flags mostly-uncovered vertical bands (a missing column
+# shows up as one) and saves latest_03_uncovered.jpg with the misses in red.
+AUDIT_ENABLED     = True
+AUDIT_SCALE       = 8      # analyse the page at 1/8 size
+AUDIT_INK_LEVEL   = 215    # grey level (0-255) below which a reduced block counts as ink
+AUDIT_WARN_FRAC   = 0.08   # WARN if more than this share of the ink is uncovered
+AUDIT_MIN_BAND_PX = 150    # report uncovered vertical bands at least this wide
+
+# ── Debug output ──────────────────────────────────────────────────────────────
+# True  → one rolling set of debug files (latest_*.jpg, latest_*.txt),
+#         overwritten by every page, so the debug folder does not grow with
+#         batch size — covers the JPEGs AND the layout/OCR .txt reports.
+# False → separate files for every file/page.
+DEBUG_OVERWRITE = True
 
 # ── Layout label taxonomy ─────────────────────────────────────────────────────
 # OCR_LABELS  → segment with DetectionPredictor, recognise with TrOCR
@@ -126,6 +169,63 @@ SINGLE_BLOCK_LABELS = {
     "Caption",
     "Footnote",
 }
+
+# Labels treated as bold/stylized display type (headlines, masthead) rather
+# than body copy — a subset of SINGLE_BLOCK_LABELS.  Caption/Footnote are
+# normal-weight text at body-ish size and don't need the treatment below.
+HEADER_LABELS = {
+    "Section-header",
+    "Page-header",
+}
+
+# "Page furniture" — headline/masthead-type content.  Used to break ties when
+# two OCR'd elements turn out to be duplicate reads of the same physical area
+# (see dedupe_overlapping_elements): a furniture label is preferred over a
+# non-furniture one, since Surya's furniture classifications are typically
+# decisive for this visually distinctive content, and a co-located generic
+# label is the more likely spurious extra detection.
+FURNITURE_LABELS = HEADER_LABELS | {"Page-footer", "Table-of-contents"}
+
+# Two elements are treated as duplicate reads of the same physical content if
+# the smaller one's area overlaps the larger by at least this fraction...
+DEDUPE_CONTAINMENT = 0.5
+# ...and only if their reading positions differ by at least this much (lines
+# of the same or an immediately neighbouring region share or nearly share one
+# position and must never be flagged).
+DEDUPE_MIN_POSITION_GAP = 1.5
+# ...and only if the two elements' areas are reasonably comparable.  A tiny
+# fragment (a stray edge sliver, a single stray character) can sit almost
+# entirely inside a large, legitimate line's box, giving near-100% overlap
+# relative to the fragment's own tiny area even though it represents a sliver
+# of that line rather than a second read of the same content — confirmed
+# (136x area ratio) vs. two genuine duplicate reads of the same masthead
+# strip (1.1x area ratio).  Above this ratio, the pair is left alone.
+DEDUPE_MAX_AREA_RATIO = 3.0
+
+# Header crops are read from the ORIGINAL (unsharpened) render with a lighter
+# preprocessing pass: the unsharp mask tuned for hairline body-text serifs
+# tends to blob together already-thick bold strokes, which hurts recognition
+# rather than helping it.
+HEADER_AUTOCONTRAST_CUTOFF = 1     # cutoff % for ImageOps.autocontrast
+
+# TrOCRProcessor resizes every crop to a fixed square input, discarding
+# aspect ratio.  A masthead or wide banner headline (width ≫ height) gets
+# squashed horizontally, compressing every letterform; this is a well-known
+# source of misreads on wide single-line crops.  A header crop wider than
+# MAX_HEADER_AR × its height is split into overlapping horizontal segments,
+# each closer to a normal line aspect ratio, read independently, and joined.
+MAX_HEADER_AR         = 6.0    # width / height threshold that triggers splitting
+HEADER_SEGMENT_OVERLAP = 0.20  # fraction of segment width shared with the next segment
+
+# Appended to every recognised element's text before it is inserted into the
+# PDF.  Guarantees a separator between two OCR'd lines however a downstream
+# tool reconstructs reading order: PyMuPDF's own extraction, a viewer's
+# copy/paste, or a naive tool that just concatenates spans in (y, x) order
+# with no join character.  Confirmed by test: without it, two adjacent lines
+# from different columns/regions can be read back with no space between them
+# at all (e.g. "…WHO REPRE-" + "TICING LAW…" → "…WHO REPRE-TICING LAW…");
+# with it, the same naive join always has a space at every element boundary.
+ELEMENT_SEPARATOR = " "
 
 # Minimum pixel dimensions for a region to bother processing.
 MIN_REGION_W = 40
@@ -240,6 +340,26 @@ def preprocess_newspaper(image: Image.Image) -> Image.Image:
     except Exception as exc:
         logger.warning(f"Preprocessing fallback: {exc}")
         return image.convert("RGB")
+
+
+def preprocess_header_crop(crop: Image.Image) -> Image.Image:
+    """
+    Light-touch preprocessing for a bold/stylized header crop (Section-header,
+    Page-header — see HEADER_LABELS).
+
+    preprocess_newspaper()'s unsharp mask is tuned to bring out thin body-text
+    serifs; applied to already-thick bold headline strokes it tends to
+    over-sharpen and blob adjacent strokes together, which hurts recognition
+    rather than helping it.  This crops from the ORIGINAL render (never the
+    globally-unsharpened page) and applies autocontrast only.
+    """
+    try:
+        gray = crop.convert("L")
+        gray = ImageOps.autocontrast(gray, cutoff=HEADER_AUTOCONTRAST_CUTOFF)
+        return gray.convert("RGB")
+    except Exception as exc:
+        logger.warning(f"Header preprocessing fallback: {exc}")
+        return crop.convert("RGB")
 
 
 def page_to_pil(page: "fitz.Page", dpi: int = DPI) -> Image.Image:
@@ -851,6 +971,80 @@ def _trocr_read(
         return "", 0.0
 
 
+def _join_segments(texts: List[str]) -> str:
+    """
+    Join OCR'd segment texts left-to-right with a space, dropping a duplicated
+    word at each boundary — the last word of one segment re-reading as the
+    first word of the next, a side effect of the deliberate overlap between
+    segments in _trocr_read_wide_crop().  Comparison ignores case and
+    surrounding punctuation.
+    """
+    out: List[str] = []
+    for t in texts:
+        words = t.split()
+        if out and words:
+            prev = out[-1].strip(".,;:!?\"'").lower()
+            cur  = words[0].strip(".,;:!?\"'").lower()
+            if prev and prev == cur:
+                words = words[1:]
+        out.extend(words)
+    return " ".join(out)
+
+
+def _trocr_read_wide_crop(
+    crop: Image.Image,
+    processor: TrOCRProcessor,
+    model: VisionEncoderDecoderModel,
+    max_ar: float = MAX_HEADER_AR,
+) -> Tuple[str, float]:
+    """
+    OCR a crop that may be much wider than it is tall (a masthead or banner
+    headline spanning most of the page width).
+
+    TrOCRProcessor resizes every crop to a fixed square input regardless of
+    its original aspect ratio.  A crop many times wider than tall gets every
+    letterform compressed horizontally by roughly that same factor, which is
+    a significant, avoidable source of misreads on wide single-line headers.
+
+    Crops within `max_ar` are read as a single call (unchanged behaviour, no
+    effect on normal headers).  Wider crops are split into overlapping
+    horizontal segments — each close to `max_ar`, and each therefore closer
+    to the aspect ratio ordinary OCR training data uses — read independently,
+    and joined with _join_segments().  Confidence is the mean across segments
+    that returned non-empty text.
+    """
+    w, h = crop.size
+    if h <= 0 or w / h <= max_ar:
+        return _trocr_read(crop, processor, model)
+
+    seg_w   = max(1, int(h * max_ar))
+    overlap = int(seg_w * HEADER_SEGMENT_OVERLAP)
+    stride  = max(1, seg_w - overlap)
+
+    texts:  List[str]   = []
+    confs:  List[float] = []
+    x = 0
+    while True:
+        x1  = min(x + seg_w, w)
+        seg = crop.crop((x, 0, x1, h))
+        text, conf = _trocr_read(seg, processor, model)
+        text = text.strip()
+        if text:
+            texts.append(text)
+            confs.append(conf)
+        if x1 >= w:
+            break
+        x += stride
+
+    joined     = _join_segments(texts)
+    confidence = sum(confs) / len(confs) if confs else 0.0
+    logger.debug(
+        f"      [WIDE-HEADER] AR={w/h:.1f} split into {len(texts)}/{-(-w // stride) if stride else 1} "
+        f"segment(s) of ~{seg_w}px → {len(joined)} char(s)"
+    )
+    return joined, confidence
+
+
 def _is_noise(
     text: str,
     confidence: float,
@@ -932,6 +1126,7 @@ def _surya_line_bboxes(
 
 def ocr_region(
     page_image: Image.Image,
+    raw_image: Image.Image,
     region: Dict,
     det_predictor: DetectionPredictor,
     trocr_processor: TrOCRProcessor,
@@ -960,11 +1155,21 @@ def ocr_region(
     When both passes yield results, the one with more accepted CHARACTERS wins
     (line count is a poor proxy: Pass 2 always yields a single "line").
 
+    HEADER_LABELS get two adjustments, in both passes:
+      - the crop is taken from `raw_image` (the un-sharpened page render) and
+        given a lighter preprocessing pass (see preprocess_header_crop) —
+        the body-text unsharp mask tends to blob together bold strokes;
+      - reads go through _trocr_read_wide_crop, which splits a crop much
+        wider than it is tall (a masthead or banner headline) into segments
+        before recognition, avoiding the aspect-ratio squash TrOCR's fixed
+        square input otherwise applies to it.  A no-op for normal-width crops.
+
     All returned bbox coordinates are in full-page (absolute) pixel space.
     """
     x0, y0, x1, y1 = [int(c) for c in region["bbox"]]
     iw, ih          = page_image.size
     label           = region["label"]
+    is_header       = label in HEADER_LABELS
 
     x0 = max(0, x0);  y0 = max(0, y0)
     x1 = min(iw, x1); y1 = min(ih, y1)
@@ -973,7 +1178,12 @@ def ocr_region(
     if rw < MIN_REGION_W or rh < MIN_REGION_H:
         return []
 
-    crop = page_image.crop((x0, y0, x1, y1))
+    if is_header:
+        crop = preprocess_header_crop(raw_image.crop((x0, y0, x1, y1)))
+        read = lambda img: _trocr_read_wide_crop(img, trocr_processor, trocr_model)
+    else:
+        crop = page_image.crop((x0, y0, x1, y1))
+        read = lambda img: _trocr_read(img, trocr_processor, trocr_model)
 
     # ── Pass 1: line detection → TrOCR per line ───────────────────────────────
     line_bboxes = _surya_line_bboxes(crop, det_predictor)
@@ -985,7 +1195,7 @@ def ocr_region(
         if lh < MIN_LINE_H or lw < MIN_LINE_W:
             continue
         line_crop        = crop.crop((lx0, ly0, lx1, ly1))
-        text, confidence = _trocr_read(line_crop, trocr_processor, trocr_model)
+        text, confidence = read(line_crop)
         if _is_noise(text, confidence, lh, lw):
             logger.debug(
                 f"      [NOISE] conf={confidence:.2f} "
@@ -1010,7 +1220,7 @@ def ocr_region(
         return pass1_elems
 
     # ── Pass 2: whole-crop TrOCR ──────────────────────────────────────────────
-    text_wb, conf_wb = _trocr_read(crop, trocr_processor, trocr_model)
+    text_wb, conf_wb = read(crop)
     pass2_elems: List[Dict] = []
 
     if not _is_noise(text_wb, conf_wb, rh, rw):
@@ -1049,14 +1259,22 @@ def ocr_region(
 # RECALL SWEEP  –  recover text no layout region claimed
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _coverage(box: List[float], elements: List[Dict]) -> float:
-    """Fraction of `box` already lying inside existing elements (0–1)."""
+def _coverage(box: List[float], elements: List[Dict], pad: float = 0.0) -> float:
+    """
+    Fraction of `box` already lying inside existing elements (0–1).
+
+    `pad` grows each existing element's box by this many px on every side
+    before checking overlap, absorbing the kind of few-pixel boundary
+    disagreement two independent detector passes over different crops of
+    the same physical line can produce, without it being (mis)read as
+    genuinely new content.
+    """
     area  = max(1.0, (box[2] - box[0]) * (box[3] - box[1]))
     total = 0.0
     for e in elements:
         b  = e["bbox"]
-        iw = min(box[2], b[2]) - max(box[0], b[0])
-        ih = min(box[3], b[3]) - max(box[1], b[1])
+        iw = min(box[2], b[2] + pad) - max(box[0], b[0] - pad)
+        ih = min(box[3], b[3] + pad) - max(box[1], b[1] - pad)
         if iw > 0 and ih > 0:
             total += iw * ih
     return min(1.0, total / area)
@@ -1085,6 +1303,247 @@ def _nearest_position(bbox: List[float], regions: List[Dict]) -> int:
     return best
 
 
+def _column_bands(layout_regions: List[Dict], page_w: float) -> List[List[float]]:
+    """
+    x-ranges occupied by column-body layout regions, merged into bands.
+
+    Returns [[x0, x1, min_position, max_position], ...] sorted left→right.
+    Only nearly page-wide regions (mastheads, banner headlines) are excluded
+    from defining a band — EVERY other region, however short, claims its own
+    x-range.  A short region (a two-line brief, a subhead) is just as real a
+    piece of Surya's own segmentation as a tall one; a column built entirely
+    from several short regions must still register as claimed, or any stray
+    content the sweep later finds there gets mistaken for a whole column the
+    layout model skipped and relocated to a wrong, distant reading position.
+    A genuinely missing column has NO regions of any height in its x-range,
+    so it still shows up as a gap between bands.
+
+    Neighbouring regions whose boxes touch or overlap in x merge into one
+    band; a column the layout model skipped entirely leaves a wide gap.
+    """
+    ivals = [
+        [r["bbox"][0], r["bbox"][2], r["position"], r["position"]]
+        for r in layout_regions
+        if (r["bbox"][2] - r["bbox"][0]) <= COLUMN_REGION_MAX_W_FRAC * page_w
+    ]
+    ivals.sort(key=lambda v: v[0])
+    bands: List[List[float]] = []
+    for x0, x1, pmin, pmax in ivals:
+        if bands and x0 - bands[-1][1] < COLUMN_GAP_MIN:
+            b = bands[-1]
+            b[1], b[2], b[3] = max(b[1], x1), min(b[2], pmin), max(b[3], pmax)
+        else:
+            bands.append([x0, x1, pmin, pmax])
+    return bands
+
+
+def _assign_recovered_positions(
+    recovered: List[Dict],
+    layout_regions: List[Dict],
+    page_w: float,
+    page_h: float,
+) -> int:
+    """
+    Give recovered lines that sit in an UNCLAIMED column a proper reading position.
+
+    Lines centred inside an existing column band keep the nearest-region
+    position assigned by the sweep.  Lines centred in an x-gap between (or
+    beside) bands are grouped into columns by x-overlap; a group is only
+    relocated in reading order if it clears BOTH MIN_UNCLAIMED_COLUMN_LINES
+    and MIN_UNCLAIMED_COLUMN_HEIGHT_FRAC — i.e. it plausibly IS a whole
+    column the layout model missed, not a handful of stray/duplicate lines a
+    coverage false-negative swept up next to a real, already-correctly-
+    positioned region.  A cluster that doesn't clear both keeps its original
+    nearest-neighbour position: at worst a harmless local duplicate, never a
+    relocation to an unrelated part of the page.
+
+    A relocated group is placed just after the last region of the bands to
+    its left, so a whole missing column reads top-to-bottom between its
+    neighbours instead of being interleaved line-by-line with them.
+    Positions may therefore be fractional (e.g. 16.5); sorting and reports
+    handle that.
+
+    Returns the number of lines actually re-positioned.
+    """
+    bands = _column_bands(layout_regions, page_w)
+    if not bands or not recovered:
+        return 0
+
+    unclaimed = [
+        e for e in recovered
+        if not any(b[0] <= (e["bbox"][0] + e["bbox"][2]) / 2 <= b[1] for b in bands)
+    ]
+    if not unclaimed:
+        return 0
+
+    # Group unclaimed lines into columns by x-overlap
+    clusters: List[List] = []                     # [x0, x1, [elements]]
+    for e in sorted(unclaimed, key=lambda e: e["bbox"][0]):
+        x0, x1 = e["bbox"][0], e["bbox"][2]
+        for c in clusters:
+            if min(x1, c[1]) - max(x0, c[0]) >= 0.5 * (x1 - x0):
+                c[0], c[1] = min(c[0], x0), max(c[1], x1)
+                c[2].append(e)
+                break
+        else:
+            clusters.append([x0, x1, [e]])
+    clusters.sort(key=lambda c: c[0])
+
+    moved = 0
+    for k, (cx0, cx1, elems) in enumerate(clusters):
+        if len(elems) < MIN_UNCLAIMED_COLUMN_LINES:
+            logger.debug(
+                f"      [SWEEP] {len(elems)} stray line(s) at x={cx0:.0f}-{cx1:.0f}px "
+                f"— too few to be a missed column, kept at nearest-neighbour position."
+            )
+            continue
+        y_span = max(e["bbox"][3] for e in elems) - min(e["bbox"][1] for e in elems)
+        if y_span < MIN_UNCLAIMED_COLUMN_HEIGHT_FRAC * page_h:
+            logger.debug(
+                f"      [SWEEP] {len(elems)} line(s) at x={cx0:.0f}-{cx1:.0f}px span only "
+                f"{y_span:.0f}px — too short to be a missed column, kept at nearest-neighbour position."
+            )
+            continue
+        centre = (cx0 + cx1) / 2
+        left   = [b[3] for b in bands if b[1] <= centre]      # max position of bands left of it
+        base   = max(left) if left else min(b[2] for b in bands) - 1
+        pos    = base + 0.5 + 0.001 * k
+        for e in elems:
+            e["reading_position"] = pos
+        moved += len(elems)
+        logger.debug(
+            f"      [SWEEP] unclaimed column x={cx0:.0f}–{cx1:.0f}px: "
+            f"{len(elems)} line(s) → reading position {pos:.3f}"
+        )
+    return moved
+
+
+def _assign_visual_rows(elements: List[Dict]) -> None:
+    """
+    Give every element a "_row" index (mutates in place) for the final sort.
+
+    Elements sharing a reading position are grouped into visual rows by
+    y-OVERLAP, not by matching y0 exactly: two fragments genuinely on the
+    same printed line rarely share an identical y0 — a few pixels of natural
+    per-box variation between separately detected fragments is ordinary
+    (confirmed on a real two-word banner headline, "DOUBLE" at y0=1109 and
+    "DEBATE" at y0=1105) — so sorting straight on y0 can flip same-row
+    fragments out of left-to-right order before an x tiebreaker is ever
+    consulted.  Within a reading position, elements are walked top-to-bottom;
+    an element starts a new row only once its y0 reaches or passes the
+    bottom of every element already placed in the current row.
+    """
+    groups: Dict[float, List[Dict]] = {}
+    for e in elements:
+        groups.setdefault(e["reading_position"], []).append(e)
+    for group in groups.values():
+        group.sort(key=lambda e: e["bbox"][1])
+        row, row_bottom = 0, None
+        for e in group:
+            y0, y1 = e["bbox"][1], e["bbox"][3]
+            if row_bottom is not None and y0 >= row_bottom:
+                row += 1
+                row_bottom = y1
+            else:
+                row_bottom = max(row_bottom, y1) if row_bottom is not None else y1
+            e["_row"] = row
+
+
+def _overlap_area(a: List[float], b: List[float]) -> float:
+    """Raw intersection area of two [x1, y1, x2, y2] boxes."""
+    ix = min(a[2], b[2]) - max(a[0], b[0])
+    iy = min(a[3], b[3]) - max(a[1], b[1])
+    return max(0.0, ix) * max(0.0, iy)
+
+
+def dedupe_overlapping_elements(elements: List[Dict]) -> List[Dict]:
+    """
+    Remove an element that is a duplicate re-read of another element's
+    physical area, at a different reading position.
+
+    This happens when Surya's own layout stage emits two overlapping regions
+    for the same content under different labels — same-label duplicates are
+    already merged by _nms_regions() before OCR, but a CROSS-label duplicate
+    (e.g. a masthead dateline correctly boxed as Page-header, and separately,
+    erroneously, boxed again as Text over almost the same pixels) survives
+    that pass, because NMS there only merges regions sharing a label — a
+    deliberate choice so a Picture region can never suppress a genuinely
+    different Text region overlapping it (see _nms_regions).  Both
+    overlapping regions then reach OCR, so the same text is inserted twice:
+    once at its correct reading position, and once wherever Surya's layout
+    stage happened to place the extra region — which can be far from where
+    the content visually sits, reading as if the transcript jumps to an
+    unrelated part of the page.  Confirmed on a real page: one region read
+    "UNIVERSITY OF IDAHO, MOSCOW, WEDNESDAY," a second time, correctly, but
+    at a reading position 15 slots later than the (garbled) first read.
+
+    Only pairs whose reading positions differ by more than
+    DEDUPE_MIN_POSITION_GAP are compared, so adjacent lines of the same or an
+    immediately neighbouring region (which share or nearly share one
+    position) are never flagged.  A pair must also have comparable AREAS
+    (DEDUPE_MAX_AREA_RATIO) — a tiny stray fragment can sit almost entirely
+    inside a large legitimate line's box (near-100% overlap relative to the
+    fragment's own tiny area) without being a second read of that line; two
+    genuine duplicate reads of the same content are much closer in size.  Of
+    a genuinely duplicate pair: if exactly one element's label is a "page
+    furniture" type (FURNITURE_LABELS — mastheads, datelines, headlines,
+    footers), it is kept and the other dropped (see FURNITURE_LABELS for
+    why).  Otherwise the lower-confidence
+    read is dropped.
+    """
+    if len(elements) < 2:
+        return elements
+    order   = sorted(range(len(elements)), key=lambda i: elements[i]["bbox"][1])
+    dropped = [False] * len(elements)
+    n_dropped = 0
+
+    for oi, i in enumerate(order):
+        if dropped[i]:
+            continue
+        a   = elements[i]
+        ay1 = a["bbox"][3]
+        area_a = max(1.0, (a["bbox"][2] - a["bbox"][0]) * (ay1 - a["bbox"][1]))
+        for j in order[oi + 1:]:
+            if dropped[j]:
+                continue
+            b = elements[j]
+            if b["bbox"][1] > ay1:      # sorted by y0 -- nothing further below can still overlap 'a'
+                break
+            if abs(a["reading_position"] - b["reading_position"]) < DEDUPE_MIN_POSITION_GAP:
+                continue
+            area_b  = max(1.0, (b["bbox"][2] - b["bbox"][0]) * (b["bbox"][3] - b["bbox"][1]))
+            overlap = _overlap_area(a["bbox"], b["bbox"])
+            if overlap / min(area_a, area_b) < DEDUPE_CONTAINMENT:
+                continue
+            if max(area_a, area_b) / min(area_a, area_b) > DEDUPE_MAX_AREA_RATIO:
+                continue   # a tiny fragment inside a big line's box, not a duplicate read of it
+
+            a_furn = a.get("source_label") in FURNITURE_LABELS
+            b_furn = b.get("source_label") in FURNITURE_LABELS
+            if a_furn != b_furn:
+                loser_key = j if a_furn else i
+            else:
+                loser_key = i if a["confidence"] <= b["confidence"] else j
+
+            dropped[loser_key] = True
+            n_dropped += 1
+            loser = elements[loser_key]
+            logger.debug(
+                f"      [DEDUPE] dropped pos={loser['reading_position']} "
+                f"label={loser.get('source_label')} conf={loser['confidence']:.2f} | "
+                f"{loser['text'][:40]!r}"
+            )
+            if loser_key == i:
+                break   # 'a' is gone -- stop comparing it further
+
+    if n_dropped:
+        logger.info(
+            f"  [DEDUPE] removed {n_dropped} duplicate element(s) "
+            f"(same content recognised twice at different reading positions)."
+        )
+    return [e for k, e in enumerate(elements) if not dropped[k]]
+
+
 def sweep_uncovered_text(
     page_image: Image.Image,
     elements: List[Dict],
@@ -1105,11 +1564,19 @@ def sweep_uncovered_text(
     - Boxes cut by an interior tile edge are ignored; the overlapping
       neighbour tile sees them whole (needs SWEEP_OVERLAP > line length).
     - `known` grows as lines are recovered, so overlapping tiles never
-      re-read the same line.
+      re-read the same line.  Coverage is checked with SWEEP_COVERAGE_PAD of
+      slack, absorbing minor boundary disagreement between this pass's
+      detector run and the per-region pass's, so an already-read line isn't
+      mistaken for new content over a few pixels of jitter.
     - Recovered lines use SWEEP_MIN_CONFIDENCE (stricter than region OCR)
       because the sweep also sees photographs and halftone.
     - Recovered lines inherit the reading position of the nearest layout
-      region and are labelled "Recovered".
+      region and are labelled "Recovered"; _assign_recovered_positions()
+      then relocates only the clusters large enough to plausibly be a whole
+      column the layout model missed (see MIN_UNCLAIMED_COLUMN_LINES /
+      MIN_UNCLAIMED_COLUMN_HEIGHT_FRAC) — everything else keeps this
+      nearest-neighbour position, never landing far from where it visually
+      sits on the page.
 
     Coordinates are in the same space as `page_image` (full-page pixels).
     """
@@ -1131,7 +1598,7 @@ def sweep_uncovered_text(
                 if lh < MIN_LINE_H or lw < MIN_LINE_W:
                     continue
                 box = [lx0 + tx, ly0 + ty, lx1 + tx, ly1 + ty]
-                if _coverage(box, known) >= SWEEP_COVERED_FRAC:
+                if _coverage(box, known, pad=SWEEP_COVERAGE_PAD) >= SWEEP_COVERED_FRAC:
                     continue
                 line = page_image.crop(tuple(int(v) for v in box))
                 text, conf = _trocr_read(line, trocr_processor, trocr_model)
@@ -1151,6 +1618,10 @@ def sweep_uncovered_text(
                 }
                 recovered.append(elem)
                 known.append(elem)
+
+    moved = _assign_recovered_positions(recovered, layout_regions, iw, ih)
+    if moved:
+        logger.info(f"  [SWEEP] {moved} recovered line(s) lie in a column the layout stage skipped.")
     return recovered
 
 
@@ -1158,35 +1629,107 @@ def sweep_uncovered_text(
 # DEBUG VISUALISATION
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _debug_path(stem: str, page_num: int, tag: str, ext: str) -> Path:
+    """
+    Path for one debug output file (a JPEG or a .txt report).
+
+    DEBUG_OVERWRITE = True  → fixed names ("latest_<tag>.<ext>"): every page
+        overwrites the previous page's file of that kind, so the debug
+        folder holds at most one page's worth of debug output however large
+        the batch is.  Applies equally to the JPEGs and the layout/OCR .txt
+        reports — a long batch run no longer accumulates one pair of reports
+        per page.
+    DEBUG_OVERWRITE = False → per-page names (original behaviour).
+    """
+    if DEBUG_OVERWRITE:
+        return DEBUG_PATH / f"latest_{tag}.{ext}"
+    return DEBUG_PATH / f"{stem}_p{page_num:03d}_{tag}.{ext}"
+
+
 def _debug_img_path(stem: str, page_num: int, tag: str) -> Path:
-    """
-    Path for a debug JPEG.
-
-    DEBUG_OVERWRITE_IMAGES = True  → fixed names ("latest_<tag>.jpg"): every
-        page overwrites the previous page's images, so the debug folder holds
-        at most one page's worth of JPEGs however large the batch is.
-    DEBUG_OVERWRITE_IMAGES = False → per-page names.
-
-    Text reports (.txt) are not affected; they stay per page.
-    """
-    if DEBUG_OVERWRITE_IMAGES:
-        return DEBUG_PATH / f"latest_{tag}.jpg"
-    return DEBUG_PATH / f"{stem}_p{page_num:03d}_{tag}.jpg"
+    """Path for a debug JPEG.  See _debug_path()."""
+    return _debug_path(stem, page_num, tag, "jpg")
 
 
-def clear_debug_images() -> None:
-    """Delete debug JPEGs left over from earlier runs (overwrite mode only)."""
-    if not DEBUG_OVERWRITE_IMAGES:
+def clear_debug_files() -> None:
+    """Delete debug JPEGs and .txt reports left over from earlier runs (overwrite mode only)."""
+    if not DEBUG_OVERWRITE:
         return
     removed = 0
-    for f in DEBUG_PATH.glob("*.jpg"):
-        try:
-            f.unlink()
-            removed += 1
-        except OSError:
-            pass
+    for pattern in ("*.jpg", "*.txt"):
+        for f in DEBUG_PATH.glob(pattern):
+            try:
+                f.unlink()
+                removed += 1
+            except OSError:
+                pass
     if removed:
-        logger.info(f"  Cleared {removed} stale debug image(s).")
+        logger.info(f"  Cleared {removed} stale debug file(s).")
+
+
+def audit_coverage(
+    page_image: Image.Image,
+    elements: List[Dict],
+    layout_regions: List[Dict],
+    stem: str,
+    page_num: int,
+) -> float:
+    """
+    Diagnostic: how much printed ink still lies outside every OCR'd box?
+
+    Works at 1/AUDIT_SCALE size.  "Ink" = dark blocks.  "Covered" = the boxes
+    of all OCR elements plus Picture/Figure regions (intentionally not read).
+    Logs the uncovered share, lists any wide vertical bands that are mostly
+    uncovered (a whole missing column shows up as one), and saves
+    latest_03_uncovered.jpg with the uncovered ink painted red.
+
+    Margin speckle and library stamps count as uncovered ink; the band test is
+    the more telling signal.  Returns the uncovered fraction (0–1).
+    """
+    s      = AUDIT_SCALE
+    small  = page_image.convert("L").reduce(s)
+    sw, sh = small.size
+    ink    = small.point(lambda v: 255 if v < AUDIT_INK_LEVEL else 0)
+    ink    = ink.filter(ImageFilter.MaxFilter(3))          # bridge the gaps between text lines
+
+    covered = Image.new("L", (sw, sh), 0)
+    cdraw   = ImageDraw.Draw(covered)
+    pad     = 6
+    boxes   = [e["bbox"] for e in elements]
+    boxes  += [r["bbox"] for r in layout_regions if r["label"] in SKIP_LABELS]
+    for x0, y0, x1, y1 in boxes:
+        cdraw.rectangle([(x0 - pad) / s, (y0 - pad) / s, (x1 + pad) / s, (y1 + pad) / s], fill=255)
+
+    uncovered = ImageChops.subtract(ink, covered)
+    total = ink.histogram()[255]
+    miss  = uncovered.histogram()[255]
+    frac  = miss / total if total else 0.0
+
+    # Vertical bands that are mostly uncovered
+    box_filter = getattr(Image, "Resampling", Image).BOX
+    col_ink  = list(ink.resize((sw, 1), box_filter).tobytes())
+    col_miss = list(uncovered.resize((sw, 1), box_filter).tobytes())
+    bands, start = [], None
+    for i in range(sw + 1):
+        bad = i < sw and col_ink[i] >= 8 and col_miss[i] >= 0.5 * col_ink[i]
+        if bad and start is None:
+            start = i
+        elif not bad and start is not None:
+            if (i - start) * s >= AUDIT_MIN_BAND_PX:
+                bands.append((start * s, i * s))
+            start = None
+
+    msg = f"  [COVERAGE] {frac * 100:.1f}% of page ink lies outside every OCR'd box"
+    if bands:
+        msg += "; mostly-uncovered band(s) at x=" + ", ".join(f"{a}–{b}px" for a, b in bands)
+    (logger.warning if (frac > AUDIT_WARN_FRAC or bands) else logger.info)(msg)
+
+    vis = Image.merge("RGB", (small, small, small))
+    vis.paste(Image.new("RGB", (sw, sh), (255, 0, 0)), mask=uncovered)
+    out = _debug_img_path(stem, page_num, "03_uncovered")
+    vis.save(str(out), "JPEG", quality=85)
+    logger.info(f"    [DEBUG] Uncovered-ink map → {out.name}")
+    return frac
 
 
 def save_layout_debug(image: Image.Image, regions: List[Dict], path: Path) -> None:
@@ -1290,12 +1833,18 @@ def process_page(
     2.  Layout      — LayoutPredictor → semantic regions + reading order positions
     3.  OCR         — DetectionPredictor (line segmentation) + TrOCR per line,
                       for every region not in SKIP_LABELS
-    3b. Sweep       — tile the page, OCR any detected line no region claimed
-    4.  Sort        — by Surya layout position, then vertical baseline within region
+    3b. Sweep       — tile the page, OCR any detected line no region claimed;
+                      lines in a column the layout model skipped are slotted
+                      into reading order between the neighbouring columns
+    3c. Dedupe      — drop an element that is a duplicate read of another
+                      element's physical area at a different reading position
+                      (a cross-label duplicate Surya's own layout stage emitted)
+    4.  Sort        — by Surya layout position, then visual row (y-overlap
+                      clustering), then x within a row (left-to-right)
+    5.  Audit       — report any printed ink still outside every OCR'd box
 
     Returns a flat list of element dicts in reading order.
     """
-    pfx = DEBUG_PATH / f"{stem}_p{page_num:03d}"      # used for the (small) .txt reports
     logger.info("")
     logger.info("─" * 62)
     logger.info(f"  PAGE {page_num}  [{pil_image.width}×{pil_image.height}]  {filename}")
@@ -1344,7 +1893,7 @@ def process_page(
         save_layout_debug(pil_image, layout_regions,
                           _debug_img_path(stem, page_num, "01_layout"))
         save_layout_report(layout_regions, image_bbox,
-                           Path(str(pfx) + "_01_layout_report.txt"),
+                           _debug_path(stem, page_num, "01_layout_report", "txt"),
                            filename, page_num)
 
     # ── Stage 3: Per-region DetectionPredictor + TrOCR ────────────────────────
@@ -1377,7 +1926,7 @@ def process_page(
             f"bbox=({bbox[0]:.0f},{bbox[1]:.0f}→{bbox[2]:.0f},{bbox[3]:.0f})"
         )
         elems = ocr_region(
-            processed, region,
+            processed, pil_image, region,
             det_predictor, trocr_processor, trocr_model,
         )
         logger.debug(f"      → {len(elems)} element(s) accepted.")
@@ -1394,16 +1943,37 @@ def process_page(
         )
         all_elements.extend(recovered)
 
+    # ── Stage 3c: De-duplicate cross-label region overlaps ────────────────────
+    before_dedupe = len(all_elements)
+    all_elements  = dedupe_overlapping_elements(all_elements)
+    if len(all_elements) < before_dedupe:
+        logger.info(
+            f"  [DEDUPE] {before_dedupe - len(all_elements)} duplicate element(s) removed."
+        )
+
     # ── Stage 4: Final reading order sort ────────────────────────────────────
-    all_elements.sort(key=lambda e: (e["reading_position"], e["bbox"][1]))
+    # Same-position elements are grouped into visual rows by y-overlap (not a
+    # raw y0 compare — see _assign_visual_rows), then rows sorted top-to-
+    # bottom and elements within a row left-to-right by x.
+    _assign_visual_rows(all_elements)
+    all_elements.sort(key=lambda e: (e["reading_position"], e["_row"], e["bbox"][0]))
+    for e in all_elements:
+        del e["_row"]
 
     logger.info(f"  [RESULT] {len(all_elements)} OCR element(s) on page {page_num}.")
+
+    # ── Stage 5: Coverage audit (diagnostic only) ─────────────────────────────
+    if AUDIT_ENABLED:
+        try:
+            audit_coverage(processed, all_elements, layout_regions, stem, page_num)
+        except Exception as exc:
+            logger.warning(f"  [COVERAGE] audit failed: {exc}")
 
     if all_elements:
         save_ocr_debug(pil_image, all_elements,
                        _debug_img_path(stem, page_num, "02_ocr_overlay"))
         save_ocr_report(all_elements,
-                        Path(str(pfx) + "_02_ocr_report.txt"),
+                        _debug_path(stem, page_num, "02_ocr_report", "txt"),
                         filename, page_num)
 
     return all_elements
@@ -1427,6 +1997,14 @@ def insert_text_layer(
     edge of its own segment (or the page), keeping search hits and text
     selection aligned with the printed line.
 
+    Every element's text gets ELEMENT_SEPARATOR appended before insertion.
+    This is a deliberate, tested guard against word fusion: two OCR'd lines
+    from different regions/columns can end up read back adjacent to one
+    another by a downstream tool with no separator at all — confirmed with a
+    naive same-row, no-separator extraction over this page's own geometry —
+    and a trailing space on every element eliminates that regardless of the
+    exact extraction method used.
+
     Returns the number of elements inserted.
     """
     iw, ih = img_size
@@ -1441,6 +2019,7 @@ def insert_text_layer(
     for elem in elements:
         bx0, by0, bx1, by1 = elem["bbox"]
         try:
+            text        = elem["text"] + ELEMENT_SEPARATOR
             x0_pt       = bx0 * sx
             x1_pt       = bx1 * sx
             baseline_pt = by1 * sy
@@ -1448,13 +2027,13 @@ def insert_text_layer(
 
             available_w = min(x1_pt, pw) - x0_pt
             if available_w > 0:
-                text_w = font.text_length(elem["text"], fontsize=fontsize)
+                text_w = font.text_length(text, fontsize=fontsize)
                 if text_w > available_w:
                     fontsize = max(MIN_CLAMPED_FONT_PT, fontsize * available_w / text_w)
 
             writer.append(
                 fitz.Point(x0_pt, baseline_pt),
-                elem["text"],
+                text,
                 font=font,
                 fontsize=fontsize,
             )
@@ -1680,7 +2259,7 @@ def main() -> None:
     logger.info(f"  TrOCR    : {TROCR_MODEL_NAME}")
     logger.info(f"  Sweep    : {'on' if SWEEP_ENABLED else 'off'}")
     logger.info(
-        f"  Debug img: {'overwrite (latest_*.jpg)' if DEBUG_OVERWRITE_IMAGES else 'per page'}"
+        f"  Debug out: {'overwrite (latest_*.jpg / .txt)' if DEBUG_OVERWRITE else 'per page'}"
     )
     logger.info("")
 
@@ -1691,7 +2270,7 @@ def main() -> None:
         logger.error(f"Input folder '{INPUT_DIR}' not found.")
         sys.exit(1)
     output_folder.mkdir(exist_ok=True)
-    clear_debug_images()
+    clear_debug_files()
 
     pdf_files = sorted(input_folder.glob("*.pdf"))
     if not pdf_files:
