@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """
-Opticolumns  –  debug_script_f.py
-======================================================================
-Base: debug_script_e.py (Surya layout + TrOCR recognition, recall sweep,
-      rolling debug images).  Pipeline/OCR logic is unchanged.
+Opticolumns  –  debug_script_h.py
 ======================================================================
 """
 
@@ -18,6 +15,10 @@ from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from xml.sax.saxutils import escape as xml_escape
+
+# (h) Let PyTorch run any operation Apple's MPS backend lacks on the CPU instead
+# of raising.  Must be set before torch is imported.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import torch
 from transformers import TrOCRProcessor, VisionEncoderDecoderModel
@@ -68,7 +69,7 @@ TROCR_MODELS = {
     "large_handwritten": "microsoft/trocr-large-handwritten",
     "large_printed":     "microsoft/trocr-large-printed",
 }
-TROCR_MODEL_NAME = TROCR_MODELS["large_handwritten"]
+TROCR_MODEL_NAME = TROCR_MODELS["large_printed"]
 
 # ── TrOCR noise-filter thresholds ────────────────────────────────────────────
 
@@ -81,6 +82,61 @@ SPARSE_LINE_WIDTH_RATIO          = 2.0    # width / (height * char count) above 
 # TrOCR generation cap (tokens).  Without an explicit cap, long column lines can
 # be truncated by the checkpoint's default generation length.
 MAX_NEW_TOKENS = 192
+
+# ── Recognition input (revision g) ────────────────────────────────────────────
+# True  → body-text recognition crops come from the RAW page render with a
+#         per-line autocontrast only (layout + line detection still use the
+#         tile-preprocessed image).
+# False → previous behaviour: recognition crops come from the preprocessed
+#         page.  Kept as a switch so the two can be A/B tested.
+# Header crops (HEADER_LABELS) always came from the raw render; unchanged.
+RECOGNIZE_FROM_RAW       = True
+LINE_AUTOCONTRAST_CUTOFF = 1       # cutoff % for the per-line autocontrast
+
+# Recognition crops are expanded by this many px into the surrounding page
+# (clamped to the page edge) so tight detector boxes don't clip ascenders,
+# descenders or the first/last letter.  Only the image TrOCR sees is padded;
+# element boxes, noise-filter geometry and the text layer use the unpadded box.
+# Keep LINE_PAD_Y below the typical inter-line gap (a few px at 300 DPI on
+# newsprint) or neighbouring lines start to intrude.
+LINE_PAD_X = 6
+LINE_PAD_Y = 3
+
+# (h) How the LINE_PAD_X horizontal padding is filled:
+#   "context" → expand into the real page (g behaviour);
+#   "border"  → crop the line at its detected x-extent and add LINE_PAD_X px
+#               of plain paper tone left and right, so a nearby column rule or
+#               gutter ink can't be read as a leading 'I', '(' or '"'.
+# Vertical padding (LINE_PAD_Y) always uses real page context.
+LINE_PAD_X_MODE = "context"
+
+# (h) Normalise TrOCR's IAM-style spacing around punctuation
+# ('Moscow , Wednesday' → 'Moscow, Wednesday'; '( alas' → '(alas').
+NORMALIZE_PUNCT_SPACING = True
+
+# ── Selective beam search (revision g) ────────────────────────────────────────
+# Every crop is decoded greedily first (explicit num_beams=1, whatever the
+# checkpoint's generation defaults).  A beam retry happens only when ALL hold:
+#   - greedy confidence >= max(BEAM_RETRY_ABOVE, the caller's noise floor)
+#     (CONFIDENCE_THRESHOLD for regions, SWEEP_MIN_CONFIDENCE for the sweep),
+#     so beam can never lift a read that was going to be discarded as noise
+#     over the filter;
+#   - greedy confidence <  BEAM_RETRY_BELOW;
+#   - the greedy text has at least BEAM_MIN_CHARS non-space characters.
+# The beam result is adopted only if its confidence is >= greedy's AND it
+# differs in more than case / spacing / punctuation (see _trocr_read).
+# The g run showed beam helping mostly for greedy confidence ~0.40–0.75 and
+# mostly hurting at 0.80+.
+BEAM_RETRY_ENABLED  = True
+BEAM_NUM_BEAMS      = 5
+BEAM_RETRY_BELOW    = 0.80
+BEAM_RETRY_ABOVE    = 0.35
+BEAM_MIN_CHARS      = 4
+BEAM_LENGTH_PENALTY = 1.0
+
+# (h) Device for TrOCR: "auto" = CUDA if present, else Apple MPS, else CPU.
+# Or force "cuda" / "mps" / "cpu".
+TROCR_DEVICE = "auto"
 
 # ── Recall sweep (safety-net for text the layout model never boxed) ──────────
 # After region OCR, the whole page is tiled with overlap; every detected text
@@ -192,10 +248,19 @@ DEDUPE_CONTAINMENT = 0.5
 
 DEDUPE_MAX_AREA_RATIO = 3.0
 
+# (h) In a duplicate pair where exactly one read is page furniture, the
+# furniture read wins UNLESS the other read is more confident by more than
+# this margin.
+DEDUPE_FURNITURE_MARGIN = 0.15
+
 HEADER_AUTOCONTRAST_CUTOFF = 1     # cutoff % for ImageOps.autocontrast
 
 MAX_HEADER_AR         = 6.0    # width / height threshold that triggers splitting
 HEADER_SEGMENT_OVERLAP = 0.20  # fraction of segment width shared with the next segment
+# (h) Only crops at least this tall are segment-split — i.e. genuine display
+# type such as the masthead.  Thin single-line strips (date line, most
+# section heads) read better whole, as body lines do.  0.3 in at the render DPI.
+HEADER_SPLIT_MIN_H     = round(DPI * 0.30)
 
 ELEMENT_SEPARATOR = " "
 
@@ -213,15 +278,28 @@ MIN_REGION_H = 15
 #                      fontname="helv"): that leaves a non-embedded base-14
 #                      reference, which PDF/A forbids.
 EMBED_FONT    = True
-MIN_FONT_PT         = 4.0    # smallest initial font size for the hidden text
-MIN_CLAMPED_FONT_PT = 1.5    # floor when shrinking a line to fit its segment; the
-                             # text is invisible, so legibility is irrelevant —
-                             # only alignment with the printed line matters
-FONT_NAME     = "helv"                       # fallback (non-embedded) font only
+MIN_FONT_PT   = 4.0    # smallest font size for the hidden text
+FONT_NAME     = "helv"                       # fallback font only
 FONT_PATH     = "fonts/FreeSans.ttf"
 FONT_URL      = ("https://github.com/opensourcedesign/fonts/raw/master/"
                  "gnu-freefont_freesans/FreeSans.ttf")
 SRGB_ICC_PATH = "srgb.icc"
+
+# ── Text-layer geometry (revision g) ──────────────────────────────────────────
+# Each line is stretched horizontally so its invisible text spans exactly the
+# printed line's box.  The stretch factor is clamped to this range purely as a
+# guard against degenerate input (an empty-looking string in a huge box); in
+# normal output it never binds, because the noise filter already rejects
+# strings far too short for their box (SPARSE_LINE_WIDTH_RATIO).
+MIN_TEXT_STRETCH = 0.05
+MAX_TEXT_STRETCH = 20.0
+
+# ── Article threads (revision g) ──────────────────────────────────────────────
+# Write Surya's reading order as a native PDF article thread: one thread per
+# page, one bead per reading-order block (a layout region, or a relocated
+# column of recovered lines), chained in reading order.  Any pre-existing
+# threads in the input PDF are replaced.  Permitted in PDF/A-1b.
+ARTICLE_THREADS_ENABLED = True
 
 # Debug colour palette keyed on layout label
 LABEL_COLOURS: Dict[str, str] = {
@@ -260,6 +338,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Per-page TrOCR counters (reset in process_page, reported at the end of it).
+_READ_STATS: Counter = Counter()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # COLOUR UTILITIES
@@ -292,6 +373,11 @@ def preprocess_newspaper(image: Image.Image) -> Image.Image:
     Runs autocontrast on overlapping 256 px tiles (CLAHE approximation),
     then applies a 1.5 px unsharp mask to sharpen hairline serifs without
     amplifying the halftone dot pattern common on period newspaper printing.
+
+    Used for layout analysis and line DETECTION.  Since revision g, body-text
+    RECOGNITION reads the raw render instead (see RECOGNIZE_FROM_RAW): the
+    tiles are pasted without blending, leaving contrast steps every 128 px
+    that a full column line crosses several times.
     """
     try:
         gray    = image.convert("L")
@@ -332,6 +418,61 @@ def preprocess_header_crop(crop: Image.Image) -> Image.Image:
     except Exception as exc:
         logger.warning(f"Header preprocessing fallback: {exc}")
         return crop.convert("RGB")
+
+
+def preprocess_line_crop(crop: Image.Image) -> Image.Image:
+    """
+    Recognition preprocessing for a single body-text line cut from the RAW
+    render: one autocontrast over the whole line (no tiling, so no seams, and
+    no unsharp mask, which TrOCR — trained on natural-looking text images —
+    does not benefit from).
+    """
+    try:
+        gray = crop.convert("L")
+        gray = ImageOps.autocontrast(gray, cutoff=LINE_AUTOCONTRAST_CUTOFF)
+        return gray.convert("RGB")
+    except Exception as exc:
+        logger.warning(f"Line preprocessing fallback: {exc}")
+        return crop.convert("RGB")
+
+
+def _passthrough_crop(crop: Image.Image) -> Image.Image:
+    """Recognition 'preprocessing' for crops already cut from the preprocessed page."""
+    return crop.convert("RGB")
+
+
+def _recognition_crop(source: Image.Image, box: List[float], prep) -> Image.Image:
+    """
+    Cut the image TrOCR will read for `box` ([x0, y0, x1, y1], absolute page
+    pixels) out of `source`, expanded by LINE_PAD_X / LINE_PAD_Y into the
+    surrounding page (clamped to its edges), then apply `prep`.
+    (h) With LINE_PAD_X_MODE = "border" the horizontal padding is plain paper
+    tone added after `prep` instead of real page content.
+    """
+    iw, ih = source.size
+    border = LINE_PAD_X_MODE == "border"                      # (h)
+    pad_x  = 0 if border else LINE_PAD_X
+    x0 = max(0,  int(box[0]) - pad_x)
+    y0 = max(0,  int(box[1]) - LINE_PAD_Y)
+    x1 = min(iw, int(box[2]) + pad_x)
+    y1 = min(ih, int(box[3]) + LINE_PAD_Y)
+    img = prep(source.crop((x0, y0, x1, y1)))
+    if border and LINE_PAD_X > 0:
+        img = ImageOps.expand(img, border=(LINE_PAD_X, 0, LINE_PAD_X, 0),
+                              fill=_paper_tone(img))
+    return img
+
+
+def _paper_tone(img: Image.Image) -> Tuple[int, int, int]:
+    """(h) Background colour of a text crop: its 90th-percentile grey level."""
+    hist   = img.convert("L").histogram()
+    target = 0.90 * sum(hist)
+    acc    = 0
+    for level, n in enumerate(hist):
+        acc += n
+        if acc >= target:
+            return (level, level, level)
+    return (255, 255, 255)
 
 
 def page_to_pil(page: "fitz.Page", dpi: int = DPI) -> Image.Image:
@@ -564,40 +705,197 @@ def apply_document_metadata(doc: "fitz.Document", filename: str) -> None:
     doc.xref_set_key(cat, "Lang", f"({DOC_LANGUAGE})")
 
 
-def setup_pdfa_compliance(pdf_path: str) -> None:
-    """
-    Embed the sRGB OutputIntent into an already-saved PDF with pikepdf.
-    MUST run after the file is on disk.
+# ══════════════════════════════════════════════════════════════════════════════
+# ARTICLE THREADS  (Surya reading order as a native PDF feature)
+# ══════════════════════════════════════════════════════════════════════════════
 
-      - skipped if the PDF already has a GTS_PDFA1 OutputIntent;
+def _article_bead_boxes(
+    elements: List[Dict],
+    layout_regions: List[Dict],
+    img_size: Tuple[int, int],
+) -> List[Tuple[float, float, float, float]]:
+    """
+    One bead rectangle per reading-order block, in final reading order, as
+    fractions (0–1) of the rendered page.
+
+    `elements` must already be in final reading order.  Elements are grouped
+    by reading_position; a group whose position belongs to a layout region
+    uses that region's box (Surya's own block outline), otherwise — a
+    relocated column of recovered lines — the union of the group's line
+    boxes.  Regions that yielded no text get no bead.  Fractions (rather than
+    points) are stored because the conversion to PDF user space is done
+    later against the page's CropBox and /Rotate (see _frac_to_pdf_rect).
+    """
+    iw, ih = img_size
+    region_boxes: Dict[float, List[List[float]]] = {}
+    for r in layout_regions:
+        if r["label"] not in SKIP_LABELS:
+            region_boxes.setdefault(r["position"], []).append(r["bbox"])
+
+    groups: Dict[float, List[List[float]]] = {}      # insertion order = reading order
+    for e in elements:
+        groups.setdefault(e["reading_position"], []).append(e["bbox"])
+
+    beads: List[Tuple[float, float, float, float]] = []
+    for pos, elem_boxes in groups.items():
+        boxes = region_boxes.get(pos) or elem_boxes
+        x0 = max(0.0, min(b[0] for b in boxes)); y0 = max(0.0, min(b[1] for b in boxes))
+        x1 = min(iw,  max(b[2] for b in boxes)); y1 = min(ih,  max(b[3] for b in boxes))
+        if x1 - x0 < MIN_LINE_W or y1 - y0 < MIN_LINE_H:
+            continue
+        beads.append((x0 / iw, y0 / ih, x1 / iw, y1 / ih))
+    return beads
+
+
+def _frac_to_pdf_rect(
+    frac: Tuple[float, float, float, float],
+    cropbox: List[float],
+    rotation: int,
+) -> List[float]:
+    """
+    Convert a box given as fractions of the DISPLAYED (rotated, cropped) page —
+    exactly what the 300 DPI render shows — into PDF user-space coordinates
+    [x0, y0, x1, y1] (origin bottom-left), using the page's CropBox and
+    /Rotate.  Written out explicitly because PyMuPDF's derotation /
+    transformation matrices do not combine correctly for rotated pages whose
+    CropBox is offset from the MediaBox origin (verified by rendering).
+    """
+    cx0, cy0, cx1, cy1 = cropbox
+    W, H = cx1 - cx0, cy1 - cy0
+    rot = rotation % 360
+    DW, DH = (H, W) if rot in (90, 270) else (W, H)
+    pts = []
+    for fx, fy in ((frac[0], frac[1]), (frac[2], frac[3])):
+        X, Y = fx * DW, fy * DH
+        if   rot == 0:   u, v = X, Y
+        elif rot == 90:  u, v = Y, H - X
+        elif rot == 180: u, v = W - X, H - Y
+        else:            u, v = W - Y, X
+        pts.append((cx0 + u, cy1 - v))
+    xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+    return [min(xs), min(ys), max(xs), max(ys)]
+
+
+def _effective_cropbox(pg: "pikepdf.Page") -> List[float]:
+    """The page's CropBox (falling back to MediaBox), clipped to the MediaBox, normalised."""
+    def norm(box) -> List[float]:
+        v = [float(x) for x in box]
+        return [min(v[0], v[2]), min(v[1], v[3]), max(v[0], v[2]), max(v[1], v[3])]
+    mb = norm(pg.mediabox)
+    try:
+        cb = norm(pg.cropbox)
+    except Exception:
+        cb = mb
+    return [max(cb[0], mb[0]), max(cb[1], mb[1]), min(cb[2], mb[2]), min(cb[3], mb[3])]
+
+
+def add_article_threads(pdf: "pikepdf.Pdf", thread_specs: Dict[int, Dict]) -> int:
+    """
+    Write one article thread per page into an open pikepdf document.
+
+    thread_specs: {page_index: {"title": str, "rotation": int,
+                                "boxes": [(fx0, fy0, fx1, fy1), ...]}}
+
+    Structure (ISO 32000-1 §12.4.3):
+      Catalog /Threads  → [thread, ...]
+      thread            → /Type /Thread  /F first-bead  /I << /Title … >>
+      bead              → /Type /Bead  /P page  /R rect  /N next  /V previous
+                          (circular list; the first bead also carries /T thread)
+      page /B           → [bead, ...] in reading order
+
+    Any threads and page /B arrays already in the file are removed first so
+    stale threads from an earlier OCR pass never survive.  Returns the number
+    of threads written.
+    """
+    root = pdf.Root
+    if "/Threads" in root:
+        logger.info("  Replacing pre-existing article threads.")
+        del root["/Threads"]
+    for pg in pdf.pages:
+        if "/B" in pg.obj:
+            del pg.obj["/B"]
+
+    threads = pikepdf.Array()
+    for idx in sorted(thread_specs):
+        spec  = thread_specs[idx]
+        boxes = spec.get("boxes") or []
+        if not boxes or idx >= len(pdf.pages):
+            continue
+        pg      = pdf.pages[idx]
+        cropbox = _effective_cropbox(pg)
+
+        thread = pdf.make_indirect(pikepdf.Dictionary({
+            "/Type": pikepdf.Name("/Thread"),
+            "/I":    pikepdf.Dictionary({"/Title": pikepdf.String(spec["title"])}),
+        }))
+        beads = [
+            pdf.make_indirect(pikepdf.Dictionary({
+                "/Type": pikepdf.Name("/Bead"),
+                "/P":    pg.obj,
+                "/R":    pikepdf.Array([round(v, 2) for v in
+                                        _frac_to_pdf_rect(b, cropbox, spec.get("rotation", 0))]),
+            }))
+            for b in boxes
+        ]
+        n = len(beads)
+        for k, bead in enumerate(beads):
+            bead["/N"] = beads[(k + 1) % n]
+            bead["/V"] = beads[k - 1]
+        beads[0]["/T"] = thread
+        thread["/F"]   = beads[0]
+        pg.obj["/B"]   = pikepdf.Array(beads)
+        threads.append(thread)
+
+    if len(threads):
+        root["/Threads"] = threads
+    return len(threads)
+
+
+def setup_pdfa_compliance(pdf_path: str, thread_specs: Optional[Dict[int, Dict]] = None) -> None:
+    """
+    Post-save pass with pikepdf.  MUST run after the file is on disk.
+
+      - embeds the sRGB OutputIntent (skipped if a GTS_PDFA1 intent exists);
+      - writes the article threads (ARTICLE_THREADS_ENABLED, see
+        add_article_threads);
       - object streams are disabled on save (not permitted in PDF/A-1).
     """
     try:
         icc = Path(SRGB_ICC_PATH)
-        if not icc.exists() or not _valid_icc(icc):
+        icc_ok = icc.exists() and _valid_icc(icc)
+        if not icc_ok:
             logger.warning("  Valid sRGB ICC profile not found; PDF/A OutputIntent skipped.")
-            return
         with pikepdf.open(pdf_path, allow_overwriting_input=True) as pdf:
-            existing = pdf.Root.get("/OutputIntents")
-            has_pdfa_intent = existing is not None and any(
-                str(oi.get("/S", "")) == "/GTS_PDFA1" for oi in existing
-            )
-            if has_pdfa_intent:
-                logger.info("  PDF/A OutputIntent already present — leaving as is.")
-            else:
-                if "/OutputIntents" not in pdf.Root:
-                    pdf.Root["/OutputIntents"] = pikepdf.Array()
-                stream = pdf.make_stream(icc.read_bytes())
-                stream.stream_dict["/N"]         = pikepdf.Integer(3)
-                stream.stream_dict["/Alternate"] = pikepdf.Name("/DeviceRGB")
-                pdf.Root["/OutputIntents"].append(pdf.make_indirect(pikepdf.Dictionary({
-                    "/Type":                      pikepdf.Name("/OutputIntent"),
-                    "/S":                         pikepdf.Name("/GTS_PDFA1"),
-                    "/Info":                      pikepdf.String("sRGB IEC61966-2.1"),
-                    "/OutputConditionIdentifier": pikepdf.String("sRGB"),
-                    "/DestOutputProfile":         pdf.make_indirect(stream),
-                })))
-                logger.info("  PDF/A OutputIntent embedded.")
+            if icc_ok:
+                existing = pdf.Root.get("/OutputIntents")
+                has_pdfa_intent = existing is not None and any(
+                    str(oi.get("/S", "")) == "/GTS_PDFA1" for oi in existing
+                )
+                if has_pdfa_intent:
+                    logger.info("  PDF/A OutputIntent already present — leaving as is.")
+                else:
+                    if "/OutputIntents" not in pdf.Root:
+                        pdf.Root["/OutputIntents"] = pikepdf.Array()
+                    stream = pdf.make_stream(icc.read_bytes())
+                    stream.stream_dict["/N"]         = pikepdf.Integer(3)
+                    stream.stream_dict["/Alternate"] = pikepdf.Name("/DeviceRGB")
+                    pdf.Root["/OutputIntents"].append(pdf.make_indirect(pikepdf.Dictionary({
+                        "/Type":                      pikepdf.Name("/OutputIntent"),
+                        "/S":                         pikepdf.Name("/GTS_PDFA1"),
+                        "/Info":                      pikepdf.String("sRGB IEC61966-2.1"),
+                        "/OutputConditionIdentifier": pikepdf.String("sRGB"),
+                        "/DestOutputProfile":         pdf.make_indirect(stream),
+                    })))
+                    logger.info("  PDF/A OutputIntent embedded.")
+
+            if ARTICLE_THREADS_ENABLED and thread_specs:
+                try:
+                    n_threads = add_article_threads(pdf, thread_specs)
+                    n_beads   = sum(len(s.get("boxes") or []) for s in thread_specs.values())
+                    logger.info(f"  Article threads: {n_threads} thread(s), {n_beads} bead(s).")
+                except Exception as exc:
+                    logger.error(f"  Article threads skipped: {exc}")
+
             pdf.save(pdf_path, object_stream_mode=pikepdf.ObjectStreamMode.disable)
     except Exception as exc:
         logger.error(f"  Failed to set up PDF/A compliance: {exc}")
@@ -606,6 +904,40 @@ def setup_pdfa_compliance(pdf_path: str) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 # MODEL LOADING
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _select_device() -> "torch.device":
+    """(h) TROCR_DEVICE, or for "auto": CUDA → Apple MPS → CPU."""
+    want = str(TROCR_DEVICE).lower()
+    mps_ok = bool(getattr(torch.backends, "mps", None)) and torch.backends.mps.is_available()
+    if want == "cuda" or (want == "auto" and torch.cuda.is_available()):
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        logger.warning("  TROCR_DEVICE='cuda' but CUDA is unavailable.")
+    if want == "mps" or (want == "auto" and mps_ok):
+        if mps_ok:
+            return torch.device("mps")
+        logger.warning("  TROCR_DEVICE='mps' but MPS is unavailable.")
+    return torch.device("cpu")
+
+
+def _device_smoke_test(processor: "TrOCRProcessor", model: "VisionEncoderDecoderModel") -> bool:
+    """
+    (h) Run one greedy and one beam decode on a blank image on the model's
+    current device.  _trocr_read swallows exceptions (returning an empty
+    read), so without this a device that can't run generate() would silently
+    produce an empty text layer instead of an error.
+    """
+    try:
+        pv = processor(Image.new("RGB", (384, 64), "white"),
+                       return_tensors="pt").pixel_values.to(next(model.parameters()).device)
+        _decode(pv, processor, model, num_beams=1)
+        if BEAM_RETRY_ENABLED and BEAM_NUM_BEAMS > 1:
+            _decode(pv, processor, model, num_beams=BEAM_NUM_BEAMS)
+        return True
+    except Exception as exc:
+        logger.warning(f"  Device smoke test failed: {exc}")
+        return False
+
 
 def load_models():
     """
@@ -664,8 +996,13 @@ def load_models():
     logger.info(f"  TrOCR processor + model: {TROCR_MODEL_NAME} …")
     trocr_processor = TrOCRProcessor.from_pretrained(TROCR_MODEL_NAME)
     trocr_model     = VisionEncoderDecoderModel.from_pretrained(TROCR_MODEL_NAME)
-    device          = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device          = _select_device()
     trocr_model.to(device)
+    trocr_model.eval()
+    if device.type != "cpu" and not _device_smoke_test(trocr_processor, trocr_model):
+        logger.warning(f"  TrOCR generation failed on {device}; falling back to CPU.")
+        device = torch.device("cpu")
+        trocr_model.to(device)
     logger.info(f"  TrOCR device: {device}")
 
     logger.info("  All models ready.\n")
@@ -1045,37 +1382,159 @@ def parse_layout_result(
 # TROCR RECOGNITION  +  NOISE FILTER
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _eos_ids(processor: TrOCRProcessor, model: VisionEncoderDecoderModel) -> set:
+    """All token ids that end a generated sequence, from whichever config carries them."""
+    ids: set = set()
+    for src in (getattr(model, "generation_config", None),
+                getattr(model, "config", None),
+                getattr(getattr(model, "config", None), "decoder", None),
+                getattr(processor, "tokenizer", None)):
+        v = getattr(src, "eos_token_id", None) if src is not None else None
+        if isinstance(v, int):
+            ids.add(v)
+        elif isinstance(v, (list, tuple)):
+            ids.update(int(x) for x in v)
+    return ids
+
+
+def _sequence_confidence(out, model: VisionEncoderDecoderModel,
+                         eos_ids: set, num_beams: int) -> float:
+    """
+    Mean per-token probability of the RETURNED sequence (0–1).
+
+    Uses model.compute_transition_scores, which follows the chosen path
+    through beam search as well as greedy decoding, so the value means the
+    same thing for both.  For greedy output it is numerically identical to
+    the previous metric (mean max-softmax per step), so CONFIDENCE_THRESHOLD
+    and the other noise-filter thresholds keep their meaning.
+
+    Only the tokens actually in the returned sequence are averaged: the
+    decoder-start token is skipped, and everything after the first EOS
+    (beam padding) is ignored.
+    """
+    if not getattr(out, "scores", None):
+        return 0.0
+    gen = out.sequences[0, 1:].tolist()                  # drop decoder-start token
+    n   = next((i + 1 for i, t in enumerate(gen) if t in eos_ids), len(gen))
+    n   = max(1, min(n, len(out.scores)))
+    try:
+        ts = model.compute_transition_scores(
+            out.sequences,
+            out.scores,
+            getattr(out, "beam_indices", None) if num_beams > 1 else None,
+            normalize_logits=(num_beams == 1),   # greedy scores are raw logits;
+        )                                        # beam scores are already log-probs
+        vals = ts[0, :min(n, ts.shape[1])].float()
+        return torch.exp(vals).mean().item() if vals.numel() else 0.0
+    except Exception as exc:
+        logger.debug(f"    transition-score confidence unavailable ({exc}); using fallback")
+        if num_beams == 1:
+            probs = [torch.softmax(s[0], dim=-1).max().item() for s in out.scores[:n]]
+            return sum(probs) / len(probs)
+        seq = getattr(out, "sequences_scores", None)        # length-normalised log-prob
+        return float(torch.exp(seq[0]).item()) if seq is not None else 0.0
+
+
+def _decode(
+    pixel_values: "torch.Tensor",
+    processor: TrOCRProcessor,
+    model: VisionEncoderDecoderModel,
+    num_beams: int,
+) -> Tuple[str, float]:
+    """One TrOCR generate() call at `num_beams`; returns (text, confidence)."""
+    kwargs = dict(
+        max_new_tokens=MAX_NEW_TOKENS,
+        num_beams=num_beams,
+        do_sample=False,
+        output_scores=True,
+        return_dict_in_generate=True,
+    )
+    if num_beams > 1:
+        kwargs.update(early_stopping=True, length_penalty=BEAM_LENGTH_PENALTY)
+    with torch.no_grad():
+        out = model.generate(pixel_values, **kwargs)
+    text = processor.batch_decode(out.sequences, skip_special_tokens=True)[0].strip()
+    conf = _sequence_confidence(out, model, _eos_ids(processor, model), num_beams)
+    return text, conf
+
+
+_PUNCT_BEFORE = re.compile(r"\s+([.,;:!?)\]])")   # space before closing punctuation
+_PUNCT_AFTER  = re.compile(r"([(\[])\s+")          # space after an opening bracket
+
+
+def _normalize_punct_spacing(text: str) -> str:
+    """(h) 'Moscow , Wednesday .' → 'Moscow, Wednesday.'; '( alas' → '(alas'.
+    Quote marks are left alone: whether a quote opens or closes can't be told
+    reliably from one line."""
+    if not NORMALIZE_PUNCT_SPACING or not text:
+        return text
+    return _PUNCT_AFTER.sub(r"\1", _PUNCT_BEFORE.sub(r"\1", text)).strip()
+
+
+def _content_key(text: str) -> str:
+    """(h) Text reduced to lower-case letters and digits, for spotting cosmetic-only changes."""
+    return re.sub(r"[\W_]+", "", text).lower()
+
+
 def _trocr_read(
     image: Image.Image,
     processor: TrOCRProcessor,
     model: VisionEncoderDecoderModel,
+    min_conf: float = CONFIDENCE_THRESHOLD,
 ) -> Tuple[str, float]:
     """
-    Run TrOCR on a single image crop.
+    Run TrOCR on a single image crop, with selective beam search.
 
-    Returns (text, confidence) where confidence is the mean max-token
-    probability across all generated tokens (0–1).  This approximates
-    per-character certainty without access to TrOCR's internal beam scores.
+    Greedy decoding first.  A beam retry is attempted only when (h):
+      - max(BEAM_RETRY_ABOVE, min_conf) <= greedy confidence < BEAM_RETRY_BELOW
+        (`min_conf` is the noise floor the caller will apply, so a read that
+        would be discarded anyway is never retried — and beam can never lift
+        it over the filter);
+      - the greedy text has >= BEAM_MIN_CHARS non-space characters.
+    The beam result is adopted only if (h):
+      - it is non-empty,
+      - its confidence is >= the greedy confidence, and
+      - it differs from the greedy text in more than case, spacing or
+        punctuation (beam's trailing-period and lower-casing habits otherwise
+        win on the per-token mean without improving anything).
+
+    The returned text has punctuation spacing normalised
+    (NORMALIZE_PUNCT_SPACING).  Returns (text, confidence), confidence being
+    the mean per-token probability of the returned sequence (0–1).
     """
     try:
         pixel_values = processor(image.convert("RGB"), return_tensors="pt").pixel_values
         device       = next(model.parameters()).device
         pixel_values = pixel_values.to(device)
-        with torch.no_grad():
-            out = model.generate(
-                pixel_values,
-                max_new_tokens=MAX_NEW_TOKENS,
-                output_scores=True,
-                return_dict_in_generate=True,
-            )
-        text = processor.batch_decode(out.sequences, skip_special_tokens=True)[0].strip()
-        if out.scores:
-            probs      = [torch.softmax(s, dim=-1) for s in out.scores]
-            max_probs  = [torch.max(p).item() for p in probs]
-            confidence = sum(max_probs) / len(max_probs)
-        else:
-            confidence = 0.0
-        return text, confidence
+
+        text, confidence = _decode(pixel_values, processor, model, num_beams=1)
+        _READ_STATS["reads"] += 1
+
+        floor = max(BEAM_RETRY_ABOVE, min_conf)
+        if (BEAM_RETRY_ENABLED and BEAM_NUM_BEAMS > 1
+                and floor <= confidence < BEAM_RETRY_BELOW
+                and len(re.sub(r"\s+", "", text)) >= BEAM_MIN_CHARS):
+            b_text, b_conf = _decode(pixel_values, processor, model, num_beams=BEAM_NUM_BEAMS)
+            _READ_STATS["beam_retries"] += 1
+            if not b_text or b_text == text:
+                _READ_STATS["beam_same"] += 1
+            elif _content_key(b_text) == _content_key(text):
+                _READ_STATS["beam_cosmetic"] += 1
+                logger.debug(f"      [BEAM-COSMETIC] kept greedy {text[:40]!r} (beam {b_text[:40]!r})")
+            elif b_conf < confidence:
+                _READ_STATS["beam_lower"] += 1
+                logger.debug(
+                    f"      [BEAM-REJECT] {confidence:.2f}>{b_conf:.2f}  kept {text[:40]!r} "
+                    f"(beam {b_text[:40]!r})"
+                )
+            else:
+                _READ_STATS["beam_changed"] += 1
+                logger.debug(
+                    f"      [BEAM] {confidence:.2f}→{b_conf:.2f}  "
+                    f"{text[:40]!r} → {b_text[:40]!r}"
+                )
+                text, confidence = b_text, b_conf
+        return _normalize_punct_spacing(text), confidence
     except Exception as exc:
         logger.debug(f"    TrOCR error: {exc}")
         return "", 0.0
@@ -1106,6 +1565,7 @@ def _trocr_read_wide_crop(
     processor: TrOCRProcessor,
     model: VisionEncoderDecoderModel,
     max_ar: float = MAX_HEADER_AR,
+    min_conf: float = CONFIDENCE_THRESHOLD,
 ) -> Tuple[str, float]:
     """
     OCR a crop that may be much wider than it is tall (a masthead or banner
@@ -1122,10 +1582,14 @@ def _trocr_read_wide_crop(
     to the aspect ratio ordinary OCR training data uses — read independently,
     and joined with _join_segments().  Confidence is the mean across segments
     that returned non-empty text.
+
+    (h) Crops shorter than HEADER_SPLIT_MIN_H are always read whole: on thin
+    single-line strips the fixed-width cuts fall mid-word and the joined read
+    is worse than TrOCR's reading of the whole line.
     """
     w, h = crop.size
-    if h <= 0 or w / h <= max_ar:
-        return _trocr_read(crop, processor, model)
+    if h <= 0 or w / h <= max_ar or h < HEADER_SPLIT_MIN_H:
+        return _trocr_read(crop, processor, model, min_conf=min_conf)
 
     seg_w   = max(1, int(h * max_ar))
     overlap = int(seg_w * HEADER_SEGMENT_OVERLAP)
@@ -1137,7 +1601,7 @@ def _trocr_read_wide_crop(
     while True:
         x1  = min(x + seg_w, w)
         seg = crop.crop((x, 0, x1, h))
-        text, conf = _trocr_read(seg, processor, model)
+        text, conf = _trocr_read(seg, processor, model, min_conf=min_conf)
         text = text.strip()
         if text:
             texts.append(text)
@@ -1241,6 +1705,16 @@ def _surya_line_bboxes(
 # PER-REGION OCR  (two-pass: detect → TrOCR per line, fallback whole-crop)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _body_recognition_source(
+    page_image: Image.Image,
+    raw_image: Image.Image,
+) -> Tuple[Image.Image, object]:
+    """(image to cut body-text recognition crops from, preprocessing for them)."""
+    if RECOGNIZE_FROM_RAW:
+        return raw_image, preprocess_line_crop
+    return page_image, _passthrough_crop
+
+
 def ocr_region(
     page_image: Image.Image,
     raw_image: Image.Image,
@@ -1272,14 +1746,19 @@ def ocr_region(
     When both passes yield results, the one with more accepted CHARACTERS wins
     (line count is a poor proxy: Pass 2 always yields a single "line").
 
-    HEADER_LABELS get two adjustments, in both passes:
-      - the crop is taken from `raw_image` (the un-sharpened page render) and
-        given a lighter preprocessing pass (see preprocess_header_crop) —
-        the body-text unsharp mask tends to blob together bold strokes;
-      - reads go through _trocr_read_wide_crop, which splits a crop much
-        wider than it is tall (a masthead or banner headline) into segments
-        before recognition, avoiding the aspect-ratio squash TrOCR's fixed
-        square input otherwise applies to it.  A no-op for normal-width crops.
+    Detection vs recognition images (revision g)
+    ─────────────────────────────────────────────
+    Line DETECTION runs on the preprocessed page (`page_image`), or for
+    HEADER_LABELS on a header-preprocessed crop of the raw render, exactly as
+    before.  RECOGNITION crops are cut separately via _recognition_crop():
+      - from `raw_image` (headers always; body text when RECOGNIZE_FROM_RAW),
+        each line autocontrasted on its own;
+      - padded by LINE_PAD_X / LINE_PAD_Y into the surrounding page.
+    Element boxes stay the unpadded detector boxes.
+
+    HEADER_LABELS reads also go through _trocr_read_wide_crop, which splits
+    a crop much wider than it is tall (a masthead or banner headline) into
+    segments before recognition.  A no-op for normal-width crops.
 
     All returned bbox coordinates are in full-page (absolute) pixel space.
     """
@@ -1296,14 +1775,16 @@ def ocr_region(
         return []
 
     if is_header:
-        crop = preprocess_header_crop(raw_image.crop((x0, y0, x1, y1)))
+        det_crop           = preprocess_header_crop(raw_image.crop((x0, y0, x1, y1)))
+        rec_src, rec_prep  = raw_image, preprocess_header_crop
         read = lambda img: _trocr_read_wide_crop(img, trocr_processor, trocr_model)
     else:
-        crop = page_image.crop((x0, y0, x1, y1))
+        det_crop           = page_image.crop((x0, y0, x1, y1))
+        rec_src, rec_prep  = _body_recognition_source(page_image, raw_image)
         read = lambda img: _trocr_read(img, trocr_processor, trocr_model)
 
     # ── Pass 1: line detection → TrOCR per line ───────────────────────────────
-    line_bboxes = _surya_line_bboxes(crop, det_predictor)
+    line_bboxes = _surya_line_bboxes(det_crop, det_predictor)
     pass1_elems: List[Dict] = []
 
     for lb in line_bboxes:
@@ -1311,7 +1792,9 @@ def ocr_region(
         lh, lw = ly1 - ly0, lx1 - lx0
         if lh < MIN_LINE_H or lw < MIN_LINE_W:
             continue
-        line_crop        = crop.crop((lx0, ly0, lx1, ly1))
+        # Absolute page coordinates (unpadded — used for the text layer)
+        abs_bbox  = [lx0 + x0, ly0 + y0, lx1 + x0, ly1 + y0]
+        line_crop = _recognition_crop(rec_src, abs_bbox, rec_prep)
         text, confidence = read(line_crop)
         if _is_noise(text, confidence, lh, lw):
             logger.debug(
@@ -1319,8 +1802,6 @@ def ocr_region(
                 f"{lw}×{lh}px | {text[:40]}"
             )
             continue
-        # Absolute page coordinates
-        abs_bbox = [lx0 + x0, ly0 + y0, lx1 + x0, ly1 + y0]
         pass1_elems.append({
             "text":             text,
             "bbox":             abs_bbox,
@@ -1337,7 +1818,8 @@ def ocr_region(
         return pass1_elems
 
     # ── Pass 2: whole-crop TrOCR ──────────────────────────────────────────────
-    text_wb, conf_wb = read(crop)
+    whole_crop = _recognition_crop(rec_src, [x0, y0, x1, y1], rec_prep)
+    text_wb, conf_wb = read(whole_crop)
     pass2_elems: List[Dict] = []
 
     if not _is_noise(text_wb, conf_wb, rh, rw):
@@ -1604,7 +2086,9 @@ def dedupe_overlapping_elements(elements: List[Dict]) -> List[Dict]:
     practice (a descender's overlap is a small fraction of a line's area),
     so position is not a useful signal here. Of a genuinely duplicate pair:
     if exactly one element's label is a "page furniture" type
-    (FURNITURE_LABELS), it is kept and the other dropped; otherwise the
+    (FURNITURE_LABELS), it is kept and the other dropped — (h) unless the
+    other read's confidence is higher by more than DEDUPE_FURNITURE_MARGIN,
+    in which case the furniture read is dropped; otherwise the
     lower-confidence read is dropped.
     """
     if len(elements) < 2:
@@ -1635,7 +2119,13 @@ def dedupe_overlapping_elements(elements: List[Dict]) -> List[Dict]:
             a_furn = a.get("source_label") in FURNITURE_LABELS
             b_furn = b.get("source_label") in FURNITURE_LABELS
             if a_furn != b_furn:
-                loser_key = j if a_furn else i
+                # (h) furniture wins unless the other read is clearly more confident
+                furn_k, other_k = (i, j) if a_furn else (j, i)
+                if (elements[other_k]["confidence"] - elements[furn_k]["confidence"]
+                        > DEDUPE_FURNITURE_MARGIN):
+                    loser_key = furn_k
+                else:
+                    loser_key = other_k
             else:
                 loser_key = i if a["confidence"] <= b["confidence"] else j
 
@@ -1694,6 +2184,7 @@ def _split_wide_sweep_line(box: List[float], bands: List[List[float]]) -> List[L
 
 def sweep_uncovered_text(
     page_image: Image.Image,
+    raw_image: Image.Image,
     elements: List[Dict],
     layout_regions: List[Dict],
     det_predictor: DetectionPredictor,
@@ -1729,6 +2220,9 @@ def sweep_uncovered_text(
       there (_split_wide_sweep_line) before coverage-checking or OCR, each
       piece read independently -- otherwise the raw tile detector can fuse
       two columns' text into one box with no boundary between them.
+    - Detection runs on `page_image` (preprocessed); recognition crops are
+      cut like body text in ocr_region (raw render when RECOGNIZE_FROM_RAW,
+      padded by LINE_PAD_X / LINE_PAD_Y).
 
     Coordinates are in the same space as `page_image` (full-page pixels).
     """
@@ -1737,6 +2231,7 @@ def sweep_uncovered_text(
     recovered: List[Dict] = []
     known: List[Dict]     = list(elements)
     column_bands = _column_bands(layout_regions, iw)
+    rec_src, rec_prep = _body_recognition_source(page_image, raw_image)
 
     for ty in _tile_origins(ih, SWEEP_TILE, SWEEP_OVERLAP):
         for tx in _tile_origins(iw, SWEEP_TILE, SWEEP_OVERLAP):
@@ -1757,8 +2252,9 @@ def sweep_uncovered_text(
                         continue
                     if _coverage(box, known, pad=SWEEP_COVERAGE_PAD) >= SWEEP_COVERED_FRAC:
                         continue
-                    line = page_image.crop(tuple(int(v) for v in box))
-                    text, conf = _trocr_read(line, trocr_processor, trocr_model)
+                    line = _recognition_crop(rec_src, box, rec_prep)
+                    text, conf = _trocr_read(line, trocr_processor, trocr_model,
+                                             min_conf=SWEEP_MIN_CONFIDENCE)
                     if _is_noise(text, conf, int(bh), int(bw), min_conf=SWEEP_MIN_CONFIDENCE):
                         logger.debug(
                             f"      [SWEEP-NOISE] conf={conf:.2f} "
@@ -1982,16 +2478,18 @@ def process_page(
     layout_predictor: LayoutPredictor,
     trocr_processor: TrOCRProcessor,
     trocr_model: VisionEncoderDecoderModel,
-) -> List[Dict]:
+) -> Tuple[List[Dict], List[Tuple[float, float, float, float]]]:
     """
     Full pipeline for a single newspaper page.
 
-    1.  Preprocess  — tiled CLAHE-approx + unsharp mask
+    1.  Preprocess  — tiled CLAHE-approx + unsharp mask (layout + detection input)
     2.  Layout      — LayoutPredictor → semantic regions + reading order positions
     2b. Reorder     — correct Surya's own position for masthead/banner regions
                       it occasionally mis-scores (see _reorder_banner_regions)
     3.  OCR         — DetectionPredictor (line segmentation) + TrOCR per line,
-                      for every region not in SKIP_LABELS
+                      for every region not in SKIP_LABELS; recognition crops
+                      come from the raw render, padded, with selective beam
+                      search (see ocr_region / _trocr_read)
     3b. Sweep       — tile the page, OCR any detected line no region claimed;
                       lines in a column the layout model skipped are slotted
                       into reading order between the neighbouring columns
@@ -2000,14 +2498,16 @@ def process_page(
                       (a cross-label duplicate Surya's own layout stage emitted)
     4.  Sort        — by Surya layout position, then visual row (y-overlap
                       clustering), then x within a row (left-to-right)
+    4b. Beads       — one article-thread bead per reading-order block
     5.  Audit       — report any printed ink still outside every OCR'd box
 
-    Returns a flat list of element dicts in reading order.
+    Returns (elements in reading order, article bead boxes as page fractions).
     """
     logger.info("")
     logger.info("─" * 62)
     logger.info(f"  PAGE {page_num}  [{pil_image.width}×{pil_image.height}]  {filename}")
     logger.info("─" * 62)
+    _READ_STATS.clear()
 
     # ── Stage 1: Preprocess ───────────────────────────────────────────────────
     processed = preprocess_newspaper(pil_image)
@@ -2100,7 +2600,7 @@ def process_page(
     # ── Stage 3b: Recall sweep ────────────────────────────────────────────────
     if SWEEP_ENABLED:
         recovered = sweep_uncovered_text(
-            processed, all_elements, layout_regions,
+            processed, pil_image, all_elements, layout_regions,
             det_predictor, trocr_processor, trocr_model,
         )
         logger.info(
@@ -2126,6 +2626,16 @@ def process_page(
         del e["_row"]
 
     logger.info(f"  [RESULT] {len(all_elements)} OCR element(s) on page {page_num}.")
+    logger.info(
+        f"  [TrOCR] {_READ_STATS['reads']} read(s); beam retries {_READ_STATS['beam_retries']}: "
+        f"{_READ_STATS['beam_changed']} adopted, "
+        f"{_READ_STATS['beam_lower']} rejected (lower conf), "
+        f"{_READ_STATS['beam_cosmetic']} cosmetic-only, "
+        f"{_READ_STATS['beam_same']} unchanged."
+    )
+
+    # ── Stage 4b: Article-thread beads (reading order as PDF structure) ──────
+    beads = _article_bead_boxes(all_elements, layout_regions, pil_image.size)
 
     # ── Stage 5: Coverage audit (diagnostic only) ─────────────────────────────
     if AUDIT_ENABLED:
@@ -2141,7 +2651,7 @@ def process_page(
                         _debug_path(stem, page_num, "02_ocr_report", "txt"),
                         filename, page_num)
 
-    return all_elements
+    return all_elements, beads
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2155,20 +2665,31 @@ def insert_text_layer(
     font: "fitz.Font",
 ) -> int:
     """
-    Insert `elements` into `page` as invisible text (render mode 3).
+    Insert `elements` into `page` as invisible text (render mode 3), each line
+    stretched to exactly fill its printed box.
 
-    Pixel coordinates (from the OCR render) are scaled to PDF points.  Each
-    line's font size is clamped so the string never extends past the right
-    edge of its own segment (or the page), keeping search hits and text
-    selection aligned with the printed line.
+    Pixel coordinates (from the OCR render) are scaled to PDF points.  For
+    every line:
+      - font size = the line's height-derived size (unchanged from before);
+      - baseline  = box bottom raised by the font's descender, so the glyph
+                    box sits on the printed line rather than below it;
+      - a horizontal morph matrix scales the string so it spans exactly
+        x0 → x1 of the box (clipped to the page), whatever the OCR text's
+        natural width.  This is the same approach as Tesseract/OCRmyPDF's
+        text layers (their Tz operator): viewers that reconstruct lines and
+        columns from glyph geometry rather than content-stream order
+        (e.g. Nitro PDF Pro) then see text exactly where the ink is.
 
-    Every element's text gets ELEMENT_SEPARATOR appended before insertion.
-    This is a deliberate, tested guard against word fusion: two OCR'd lines
-    from different regions/columns can end up read back adjacent to one
-    another by a downstream tool with no separator at all — confirmed with a
-    naive same-row, no-separator extraction over this page's own geometry —
-    and a trailing space on every element eliminates that regardless of the
-    exact extraction method used.
+    Each line is written with its own TextWriter.write_text() call, in the
+    given (reading) order, so the content stream still follows Surya's
+    reading order.  PyMuPDF reuses one embedded font object across the calls,
+    and save(clean=True) merges the per-line content snippets into a single
+    stream.
+
+    ELEMENT_SEPARATOR (a space) is still appended to every line as a guard
+    against word fusion between lines/columns.  The stretch is computed on
+    the text WITHOUT it, so the space falls just past the line's right edge,
+    which is where a reader expects a word break.
 
     Returns the number of elements inserted.
     """
@@ -2178,36 +2699,46 @@ def insert_text_layer(
 
     logger.debug(f"    {iw}×{ih}px → {pw:.1f}×{ph:.1f}pt  (sx={sx:.4f}, sy={sy:.4f})")
 
-    writer   = fitz.TextWriter(page.rect)
     inserted = 0
+    stretches: List[float] = []
 
     for elem in elements:
         bx0, by0, bx1, by1 = elem["bbox"]
         try:
-            text        = elem["text"] + ELEMENT_SEPARATOR
-            x0_pt       = bx0 * sx
-            x1_pt       = bx1 * sx
-            baseline_pt = by1 * sy
-            fontsize    = max(MIN_FONT_PT, elem["font_size"] * sy)
+            body = elem["text"].strip()
+            if not body:
+                continue
+            x0_pt    = max(0.0, bx0 * sx)
+            x1_pt    = min(pw,  bx1 * sx)
+            target_w = x1_pt - x0_pt
+            if target_w <= 0:
+                continue
+            fontsize  = max(MIN_FONT_PT, elem["font_size"] * sy)
+            natural_w = font.text_length(body, fontsize=fontsize)
+            if natural_w <= 0:
+                continue
+            stretch = min(MAX_TEXT_STRETCH, max(MIN_TEXT_STRETCH, target_w / natural_w))
+            origin  = fitz.Point(x0_pt, by1 * sy + font.descender * fontsize)
 
-            available_w = min(x1_pt, pw) - x0_pt
-            if available_w > 0:
-                text_w = font.text_length(text, fontsize=fontsize)
-                if text_w > available_w:
-                    fontsize = max(MIN_CLAMPED_FONT_PT, fontsize * available_w / text_w)
-
-            writer.append(
-                fitz.Point(x0_pt, baseline_pt),
-                text,
-                font=font,
-                fontsize=fontsize,
+            writer = fitz.TextWriter(page.rect)
+            writer.append(origin, body + ELEMENT_SEPARATOR, font=font, fontsize=fontsize)
+            writer.write_text(
+                page,
+                overlay=True,
+                render_mode=3,
+                color=(0, 0, 0),
+                morph=(origin, fitz.Matrix(stretch, 1)),
             )
             inserted += 1
+            stretches.append(stretch)
         except Exception as exc:
             logger.debug(f"    Text insert skipped: {exc}")
 
-    if inserted:
-        writer.write_text(page, overlay=True, render_mode=3, color=(0, 0, 0))
+    if stretches:
+        s = sorted(stretches)
+        logger.debug(
+            f"    Horizontal stretch: min {s[0]:.2f}  median {s[len(s) // 2]:.2f}  max {s[-1]:.2f}"
+        )
     return inserted
 
 
@@ -2229,16 +2760,19 @@ def process_pdf(
     Workflow (no flatten step — original image streams are never re-encoded):
       1. Open the ORIGINAL PDF.
       2. For each page: render (OCR copy only) → OCR → strip any pre-existing
-         text layer → insert the new invisible text layer.
+         text layer → insert the new invisible text layer; collect the
+         page's article-thread beads.
       3. Write Info-dict + XMP metadata and accessibility catalog entries.
       4. Subset the embedded font (if fonttools is installed) and save once
          with deflate.
-      5. Add the PDF/A sRGB OutputIntent (pikepdf) and verify extractable text.
+      5. pikepdf pass: PDF/A sRGB OutputIntent + article threads; then verify
+         extractable text.
 
     Returns True if the output PDF contains extractable text.
     """
     filename = os.path.basename(input_path)
     stem     = Path(input_path).stem
+    thread_specs: Dict[int, Dict] = {}
 
     logger.info(f"\n{'━'*62}")
     logger.info(f"  PROCESSING: {filename}")
@@ -2263,7 +2797,7 @@ def process_pdf(
                 pil_img  = page_to_pil(page, dpi=DPI)
                 img_size = pil_img.size
                 try:
-                    elements = process_page(
+                    elements, beads = process_page(
                         pil_img, page_num, filename, stem,
                         det_predictor, layout_predictor,
                         trocr_processor, trocr_model,
@@ -2271,18 +2805,18 @@ def process_pdf(
                 except Exception as exc:
                     logger.error(f"  OCR failed for page {page_num}: {exc}")
                     import traceback; traceback.print_exc()
-                    elements = []
+                    elements, beads = [], []
                 del pil_img
-
-                if not elements:
-                    logger.info(f"  Page {page_num}: no elements.")
-                    continue
 
                 # ── Strip any pre-existing text layer ─────────────────────────
                 # Previously OCR'd / partially searchable scans would otherwise
                 # end up with a doubled text layer.  A page-sized redaction is
                 # applied with PDF_REDACT_IMAGE_NONE so image streams are
                 # untouched — only text operators are removed.
+                # (h) Done on EVERY page, before the no-elements check, so a
+                # page where OCR finds nothing ends up with no text rather than
+                # silently keeping the input's original (non-TrOCR) text layer.
+                # All text in the output therefore comes from TrOCR.
                 existing_text = page.get_text().strip()
                 if existing_text:
                     logger.info(
@@ -2292,10 +2826,21 @@ def process_pdf(
                     page.add_redact_annot(page.rect)
                     page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
 
+                if not elements:
+                    logger.info(f"  Page {page_num}: no elements (page left without text).")
+                    continue
+
                 inserted = insert_text_layer(page, elements, img_size, font)
                 logger.info(
                     f"  Page {page_num}: inserted {inserted}/{len(elements)} element(s)."
                 )
+
+                if beads:
+                    thread_specs[idx] = {
+                        "title":    f"{stem} — page {page_num}",
+                        "rotation": page.rotation,
+                        "boxes":    beads,
+                    }
 
             # ── Metadata + accessibility entries ──────────────────────────────
             apply_document_metadata(doc, filename)
@@ -2315,15 +2860,15 @@ def process_pdf(
             doc.save(
                 output_path,
                 deflate=True,          # compress streams (text, metadata, etc.)
-                garbage=4,             # remove unused objects
-                clean=True,
+                garbage=4,             # remove unused / merge duplicate objects
+                clean=True,            # also merges the per-line text snippets
                 deflate_images=False,  # leave original image streams untouched
                 encryption=fitz.PDF_ENCRYPT_KEEP,
             )
             logger.info(f"  Saved: {output_path}")
 
-        # ── PDF/A OutputIntent — MUST run after the file is on disk ───────────
-        setup_pdfa_compliance(output_path)
+        # ── PDF/A OutputIntent + article threads — MUST run after the save ────
+        setup_pdfa_compliance(output_path, thread_specs)
 
         # ── Verify OCR layer ──────────────────────────────────────────────────
         with fitz.open(output_path) as chk:
@@ -2353,7 +2898,8 @@ def compress_to_target_size(input_pdf: Path, output_pdf: Path, original_size: in
     Try to keep the output within 15 % of the original size using PDF-native
     deflate only.  Image streams are never re-encoded (no generation loss,
     archival quality preserved).  A result is accepted only if it fits the
-    budget AND still contains extractable text.
+    budget AND still contains extractable text.  (Article threads are
+    reachable from the catalog and survive these re-saves.)
     """
     max_target = int(original_size * 1.15)
     current    = input_pdf.stat().st_size
@@ -2422,7 +2968,20 @@ def main() -> None:
     logger.info(f"  Debug    : {DEBUG_PATH.resolve()}")
     logger.info(f"  DPI      : {DPI}")
     logger.info(f"  TrOCR    : {TROCR_MODEL_NAME}")
+    logger.info(
+        f"  Recog.   : {'raw render' if RECOGNIZE_FROM_RAW else 'preprocessed page'}, "
+        f"pad {LINE_PAD_X}×{LINE_PAD_Y}px ({LINE_PAD_X_MODE}), "
+        f"punct spacing {'normalised' if NORMALIZE_PUNCT_SPACING else 'raw'}"
+    )
+    logger.info(
+        f"  Beams    : "
+        + (f"{BEAM_NUM_BEAMS} when greedy conf in [max({BEAM_RETRY_ABOVE:.2f}, floor), "
+           f"{BEAM_RETRY_BELOW:.2f}) and ≥{BEAM_MIN_CHARS} chars; adopt only if conf ≥ greedy"
+           if BEAM_RETRY_ENABLED else "off (greedy only)")
+    )
+    logger.info(f"  Headers  : split only when ≥{HEADER_SPLIT_MIN_H}px tall and AR > {MAX_HEADER_AR}")
     logger.info(f"  Sweep    : {'on' if SWEEP_ENABLED else 'off'}")
+    logger.info(f"  Threads  : {'on' if ARTICLE_THREADS_ENABLED else 'off'}")
     logger.info(
         f"  Debug out: {'overwrite (latest_*.jpg / .txt)' if DEBUG_OVERWRITE else 'per page'}"
     )
