@@ -57,7 +57,7 @@ APP_CREATOR   = f"{APP_NAME} {APP_VERSION}"          # "Opticolumns 2026"
 DOC_SUBJECT   = "OCR-processed historic newspaper"
 DOC_LANGUAGE  = "en-US"                              # BCP-47; written to XMP + /Lang
 # Namespace for the custom opt: XMP properties (declared via a PDF/A extension schema)
-OPT_NAMESPACE = "http://github.com/Scholarly-Projects/opticolumn/"
+OPT_NAMESPACE = "hhttps://github.com/Scholarly-Projects/opticolumns"
 
 # ── TrOCR model selection ─────────────────────────────────────────────────────
 # large_handwritten performs best on aged/degraded historic newspaper type.
