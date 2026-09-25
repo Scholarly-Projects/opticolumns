@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """
-Opticolumns  –  debug_script_f.py
-======================================================================
-Base: debug_script_e.py (Surya layout + TrOCR recognition, recall sweep,
-      rolling debug images).  Pipeline/OCR logic is unchanged.
+Opticolumns  –  debug_script_f_e2.py
 ======================================================================
 """
 
@@ -15,6 +12,7 @@ import shutil
 import platform
 import logging
 from collections import Counter
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from xml.sax.saxutils import escape as xml_escape
@@ -99,19 +97,33 @@ SPARSE_LINE_WIDTH_RATIO          = 1.2
 MAX_NEW_TOKENS = 96
  
 # ── Recall sweep ──────────────────────────────────────────────────────────────
-# [DISTORTED] (True) — the sweep re-reads every line that no ACCEPTED element
-# covers, including the lines the region pass just rejected as noise, and so
-# gives each hallucination a second chance.  On a page like the sample,
-# Surya already boxes the legible ads, so the sweep's recall gain is small and
-# its false positives are many.  Disabling it also removes a second, sweep-
-# based source of doubled words like "Past Pastime".
-SWEEP_ENABLED        = False
+# Re-enabled in e2.  The sweep tiles the whole page and reads any detected
+# line no accepted element covers — this is what recovers a column Surya's
+# layout pass skipped.  Its old failure mode on distorted pages (re-reading
+# lines the region pass had already rejected) is closed by
+# SWEEP_SKIP_EXAMINED below.
+SWEEP_ENABLED        = True
 SWEEP_TILE           = 1920
 SWEEP_OVERLAP        = 960
 SWEEP_EDGE_MARGIN    = 6
 SWEEP_COVERED_FRAC   = 0.50
-# [DISTORTED] (0.40) — only matters if the sweep is switched back on.
-SWEEP_MIN_CONFIDENCE = 0.70
+# [DISTORTED] (0.40) — stricter than region OCR (0.45 here) because the sweep
+# also sees photographs, rules and halftone, but not so strict that a
+# legible missed column is thrown away.  Raise toward 0.70 if recovered
+# lines on bad pages are still mostly noise; lower toward 0.45 if a missed
+# column comes back with gaps.
+SWEEP_MIN_CONFIDENCE = 0.55
+
+# True → lines the region pass read and REJECTED count as covered, so the
+# sweep never gives them a second chance.  Areas no region claimed are
+# unaffected.  Set False to restore script F's original sweep behaviour.
+SWEEP_SKIP_EXAMINED  = True
+
+# Sweep-only: a read this short (1–3 characters) off a line box wider than
+# SWEEP_SHORT_TEXT_MAX_AR × its height is TrOCR's language prior filling a
+# smeared line ("to", "0", "#"), not a reading.
+SWEEP_SHORT_TEXT_MAX_CHARS = 3
+SWEEP_SHORT_TEXT_MAX_AR    = 6.0
  
 # ── Column bands ──────────────────────────────────────────────────────────────
 COLUMN_REGION_MAX_W_FRAC = 0.40
@@ -187,6 +199,18 @@ FURNITURE_LABELS = HEADER_LABELS | {"Page-footer", "Table-of-contents"}
 DEDUPE_CONTAINMENT = 0.5
  
 DEDUPE_MAX_AREA_RATIO = 3.0
+
+# ── Stacked duplicate reads (new in f_e) ──────────────────────────────────────
+# (A) A SINGLE_BLOCK_LABELS region whose line detector found more than this
+#     many separate rows keeps its per-line reads; the whole-crop read is
+#     only a fallback for genuinely one-row (or undetectable) blocks.
+PASS2_MAX_ROWS = 1
+
+# (B) Text-aware duplicate removal (dedupe_same_text_overlaps).
+DUP_TEXT_SIMILARITY = 0.75   # normalised-text similarity treated as "same text"
+DUP_MIN_CHARS       = 6      # ignore very short strings ("Idaho" vs "Ida")
+DUP_Y_OVERLAP       = 0.5    # y-overlap, as a share of the SHORTER box's height
+DUP_X_OVERLAP       = 0.5    # x-overlap, as a share of the NARROWER box's width
  
 HEADER_AUTOCONTRAST_CUTOFF = 1
  
@@ -1228,6 +1252,28 @@ def _surya_line_bboxes(
         return []
 
 
+def _count_rows(boxes: List[List[float]]) -> int:
+    """
+    Number of distinct text rows among detector boxes.  Boxes that overlap
+    in y by more than half the smaller box's height count as one row, so a
+    headline the detector split into two side-by-side fragments is still
+    one row.
+    """
+    rows = 0
+    prev: Optional[List[float]] = None
+    for b in sorted(boxes, key=lambda b: b[1]):
+        if prev is not None:
+            ov = min(b[3], prev[3]) - max(b[1], prev[1])
+            sh = min(b[3] - b[1], prev[3] - prev[1])
+            if sh > 0 and ov / sh > 0.5:
+                prev = [min(prev[0], b[0]), min(prev[1], b[1]),
+                        max(prev[2], b[2]), max(prev[3], b[3])]
+                continue
+        rows += 1
+        prev = list(b)
+    return rows
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PER-REGION OCR  (two-pass: detect → TrOCR per line, fallback whole-crop)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1239,9 +1285,15 @@ def ocr_region(
     det_predictor: DetectionPredictor,
     trocr_processor: TrOCRProcessor,
     trocr_model: VisionEncoderDecoderModel,
+    examined_out: Optional[List[List[float]]] = None,
 ) -> List[Dict]:
     """
     Two-pass OCR for a single layout region.
+
+    examined_out (e2): if given, the absolute boxes of lines this region
+    READ AND REJECTED are appended to it — and the whole region box when
+    nothing in it was accepted — so the recall sweep can treat them as
+    already examined (see SWEEP_SKIP_EXAMINED).
 
     Pass 1 — DetectionPredictor + TrOCR per line
     ─────────────────────────────────────────────
@@ -1255,6 +1307,13 @@ def ocr_region(
     Triggered when:
       (a) label is in SINGLE_BLOCK_LABELS  (always attempt whole-crop), OR
       (b) Pass 1 returns zero accepted lines for any label.
+
+    Exception (f_e): a SINGLE_BLOCK_LABELS region in which the detector
+    found more than PASS2_MAX_ROWS separate rows, and Pass 1 accepted at
+    least one line, keeps its Pass 1 reads.  A multi-row block squeezed into
+    one TrOCR input comes back as roughly one line of text, placed on the
+    region's bottom edge — where it stacks on top of another region's read
+    of that same line and produces interleaved text in the PDF.
 
     Without detection, TrOCR receives the entire region crop as one image.
     This is the correct approach for a single-line banner headline or masthead
@@ -1286,6 +1345,19 @@ def ocr_region(
     if rw < MIN_REGION_W or rh < MIN_REGION_H:
         return []
 
+    rejected_boxes: List[List[float]] = []
+
+    def _finish(elems: List[Dict]) -> List[Dict]:
+        """Report examined-but-rejected areas to the caller, then return."""
+        if examined_out is not None:
+            if elems:
+                examined_out.extend(rejected_boxes)
+            else:
+                # Nothing in this region was legible: the whole region has
+                # been examined, not just the individual lines.
+                examined_out.append([float(x0), float(y0), float(x1), float(y1)])
+        return elems
+
     if is_header:
         crop = preprocess_header_crop(raw_image.crop((x0, y0, x1, y1)))
         read = lambda img: _trocr_read_wide_crop(img, trocr_processor, trocr_model)
@@ -1309,6 +1381,8 @@ def ocr_region(
                 f"      [NOISE] conf={confidence:.2f} "
                 f"{lw}×{lh}px | {text[:40]}"
             )
+            rejected_boxes.append([float(lx0 + x0), float(ly0 + y0),
+                                   float(lx1 + x0), float(ly1 + y0)])
             continue
         # Absolute page coordinates
         abs_bbox = [lx0 + x0, ly0 + y0, lx1 + x0, ly1 + y0]
@@ -1322,10 +1396,19 @@ def ocr_region(
         })
 
     n_pass1 = len(pass1_elems)
+    n_rows  = _count_rows([lb for lb in line_bboxes
+                           if lb[3] - lb[1] >= MIN_LINE_H and lb[2] - lb[0] >= MIN_LINE_W])
 
     if n_pass1 > 0 and label not in SINGLE_BLOCK_LABELS:
         logger.debug(f"      Pass 1 (det+TrOCR): {n_pass1} line(s)")
-        return pass1_elems
+        return _finish(pass1_elems)
+
+    if n_pass1 > 0 and n_rows > PASS2_MAX_ROWS:
+        logger.debug(
+            f"      Pass 1 kept for multi-row {label} ({n_rows} rows) — "
+            f"whole-crop read skipped."
+        )
+        return _finish(pass1_elems)
 
     # ── Pass 2: whole-crop TrOCR ──────────────────────────────────────────────
     text_wb, conf_wb = read(crop)
@@ -1353,14 +1436,14 @@ def ocr_region(
         )
         # Prefer whichever pass recovered more text
         if chars2 >= chars1:
-            return pass2_elems
+            return _finish(pass2_elems)
 
     if n_pass1 > 0:
         logger.debug(f"      Kept Pass 1 ({n_pass1} lines) over Pass 2 ({n_pass2})")
-        return pass1_elems
+        return _finish(pass1_elems)
 
     logger.debug(f"      Both passes empty for label={label}")
-    return []
+    return _finish([])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1649,6 +1732,88 @@ def dedupe_overlapping_elements(elements: List[Dict]) -> List[Dict]:
     return [e for k, e in enumerate(elements) if not dropped[k]]
 
 
+def _norm_text(t: str) -> str:
+    """Lower-case letters and digits only: 'Jewelers . Engravers' → 'jewelersengravers'."""
+    return re.sub(r"[^a-z0-9]", "", t.lower())
+
+
+def dedupe_same_text_overlaps(elements: List[Dict]) -> List[Dict]:
+    """
+    Drop the second of two elements that overlap on the page AND carry the
+    same text, regardless of how different their box sizes are.
+
+    Complements dedupe_overlapping_elements(), whose area-ratio guard
+    (correctly) spares a small fragment inside a large box — but also spares
+    a genuine duplicate when one read's box is a whole region and the
+    other's is a single line.  Requiring the TEXT to match too makes it safe
+    to ignore box size here.
+
+    Which copy is kept:
+      - near-identical texts → the smaller (tighter) box, whose invisible
+        text lines up better with the printed line;
+      - one text contained in a clearly longer one → the longer text, so no
+        content is lost.
+    """
+    if len(elements) < 2:
+        return elements
+    order   = sorted(range(len(elements)), key=lambda i: elements[i]["bbox"][1])
+    dropped = [False] * len(elements)
+    norms   = [_norm_text(e["text"]) for e in elements]
+
+    def area(b):
+        return max(1.0, (b[2] - b[0]) * (b[3] - b[1]))
+
+    for oi, i in enumerate(order):
+        if dropped[i]:
+            continue
+        a = elements[i]
+        for j in order[oi + 1:]:
+            if dropped[i]:
+                break
+            if dropped[j]:
+                continue
+            b = elements[j]
+            if b["bbox"][1] > a["bbox"][3]:
+                break
+            na, nb = norms[i], norms[j]
+            if min(len(na), len(nb)) < DUP_MIN_CHARS:
+                continue
+
+            ab, bb = a["bbox"], b["bbox"]
+            y_ov = min(ab[3], bb[3]) - max(ab[1], bb[1])
+            x_ov = min(ab[2], bb[2]) - max(ab[0], bb[0])
+            if y_ov <= 0 or x_ov <= 0:
+                continue
+            if y_ov / min(ab[3] - ab[1], bb[3] - bb[1]) < DUP_Y_OVERLAP:
+                continue
+            if x_ov / min(ab[2] - ab[0], bb[2] - bb[0]) < DUP_X_OVERLAP:
+                continue
+
+            short_k, long_k = (i, j) if len(na) <= len(nb) else (j, i)
+            ns, nl = norms[short_k], norms[long_k]
+            similar   = SequenceMatcher(None, na, nb, autojunk=False).ratio() >= DUP_TEXT_SIMILARITY
+            contained = (not similar) and ns in nl and len(nl) >= 1.3 * len(ns)
+            if not (similar or contained):
+                continue
+
+            if contained:
+                loser = short_k
+            else:
+                loser = i if area(ab) > area(bb) else j
+            dropped[loser] = True
+            e = elements[loser]
+            logger.debug(
+                f"      [DUP-TEXT] dropped {e.get('source_label')} "
+                f"({e['bbox'][0]:.0f},{e['bbox'][1]:.0f}→{e['bbox'][2]:.0f},{e['bbox'][3]:.0f}) "
+                f"| {e['text'][:50]!r}"
+            )
+
+    n = sum(dropped)
+    if n:
+        logger.info(f"  [DUP-TEXT] removed {n} stacked duplicate read(s) of the same line.")
+    return [e for k, e in enumerate(elements) if not dropped[k]]
+
+
 def _split_wide_sweep_line(box: List[float], bands: List[List[float]]) -> List[List[float]]:
     """
     If `box` [x0,y0,x1,y1] straddles a known column-band edge, split it into
@@ -1690,9 +1855,19 @@ def sweep_uncovered_text(
     det_predictor: DetectionPredictor,
     trocr_processor: TrOCRProcessor,
     trocr_model: VisionEncoderDecoderModel,
+    examined_boxes: Optional[List[List[float]]] = None,
 ) -> List[Dict]:
     """
     Recall safety-net.
+
+    e2 changes:
+    - `examined_boxes` (lines and regions the region pass read and rejected)
+      count as covered when SWEEP_SKIP_EXAMINED is on, so a rejected
+      hallucination doesn't get a second chance here.  A column the layout
+      model never boxed has no examined boxes and is swept in full.
+    - A sweep line rejected as noise is added to `known`, so the
+      overlapping neighbour tile doesn't read it again.
+    - Sweep-only short-text filter (SWEEP_SHORT_TEXT_*).
 
     The layout model runs at a much lower internal resolution than the page
     render, so on dense broadsheets it can miss small blocks entirely.  This
@@ -1727,6 +1902,8 @@ def sweep_uncovered_text(
     m      = SWEEP_EDGE_MARGIN
     recovered: List[Dict] = []
     known: List[Dict]     = list(elements)
+    if SWEEP_SKIP_EXAMINED and examined_boxes:
+        known += [{"bbox": b} for b in examined_boxes]
     column_bands = _column_bands(layout_regions, iw)
 
     for ty in _tile_origins(ih, SWEEP_TILE, SWEEP_OVERLAP):
@@ -1750,11 +1927,15 @@ def sweep_uncovered_text(
                         continue
                     line = page_image.crop(tuple(int(v) for v in box))
                     text, conf = _trocr_read(line, trocr_processor, trocr_model)
-                    if _is_noise(text, conf, int(bh), int(bw), min_conf=SWEEP_MIN_CONFIDENCE):
+                    short_wide = (len(text.strip()) <= SWEEP_SHORT_TEXT_MAX_CHARS
+                                  and bh > 0 and bw / bh > SWEEP_SHORT_TEXT_MAX_AR)
+                    if short_wide or _is_noise(text, conf, int(bh), int(bw),
+                                               min_conf=SWEEP_MIN_CONFIDENCE):
                         logger.debug(
                             f"      [SWEEP-NOISE] conf={conf:.2f} "
                             f"{int(bw)}×{int(bh)}px | {text[:40]}"
                         )
+                        known.append({"bbox": box})   # don't re-read from the next tile
                         continue
                     elem = {
                         "text":             text,
@@ -1983,12 +2164,16 @@ def process_page(
                       it occasionally mis-scores (see _reorder_banner_regions)
     3.  OCR         — DetectionPredictor (line segmentation) + TrOCR per line,
                       for every region not in SKIP_LABELS
-    3b. Sweep       — tile the page, OCR any detected line no region claimed;
-                      lines in a column the layout model skipped are slotted
-                      into reading order between the neighbouring columns
+    3b. Sweep       — tile the page, OCR any detected line no region claimed
+                      (skipping areas the region pass already read and
+                      rejected); lines in a column the layout model skipped
+                      are slotted into reading order between the neighbouring
+                      columns
     3c. Dedupe      — drop an element that is a duplicate read of another
                       element's physical area at a different reading position
-                      (a cross-label duplicate Surya's own layout stage emitted)
+                      (a cross-label duplicate Surya's own layout stage emitted),
+                      then drop overlapping elements carrying the same text
+                      whatever their box sizes (dedupe_same_text_overlaps)
     4.  Sort        — by Surya layout position, then visual row (y-overlap
                       clustering), then x within a row (left-to-right)
     5.  Audit       — report any printed ink still outside every OCR'd box
@@ -2071,7 +2256,8 @@ def process_page(
         f"{len(skip_regions)} region(s) skipped."
     )
 
-    all_elements: List[Dict] = []
+    all_elements: List[Dict]          = []
+    examined_boxes: List[List[float]] = []   # read-and-rejected areas (for the sweep)
 
     for ri, region in enumerate(sorted(text_regions, key=lambda r: r["position"])):
         lbl  = region["label"]
@@ -2084,15 +2270,22 @@ def process_page(
         elems = ocr_region(
             processed, pil_image, region,
             det_predictor, trocr_processor, trocr_model,
+            examined_out=examined_boxes,
         )
         logger.debug(f"      → {len(elems)} element(s) accepted.")
         all_elements.extend(elems)
 
     # ── Stage 3b: Recall sweep ────────────────────────────────────────────────
     if SWEEP_ENABLED:
+        if SWEEP_SKIP_EXAMINED:
+            logger.info(
+                f"  [SWEEP] {len(examined_boxes)} read-and-rejected area(s) "
+                f"excluded from the sweep."
+            )
         recovered = sweep_uncovered_text(
             processed, all_elements, layout_regions,
             det_predictor, trocr_processor, trocr_model,
+            examined_boxes=examined_boxes,
         )
         logger.info(
             f"  [SWEEP] recovered {len(recovered)} line(s) the layout stage missed."
@@ -2106,6 +2299,9 @@ def process_page(
         logger.info(
             f"  [DEDUPE] {before_dedupe - len(all_elements)} duplicate element(s) removed."
         )
+    # Same text on the same stretch of page, whatever the box sizes — catches
+    # a region-sized read stacked on a line-sized read of the same line.
+    all_elements = dedupe_same_text_overlaps(all_elements)
 
     # ── Stage 4: Final reading order sort ────────────────────────────────────
     # Same-position elements are grouped into visual rows by y-overlap (not a
