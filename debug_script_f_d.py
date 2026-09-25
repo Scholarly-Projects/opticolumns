@@ -42,187 +42,178 @@ from surya.settings import settings
 INPUT_DIR  = "A"
 OUTPUT_DIR = "B"
 DEBUG_DIR  = "debug"
-
+ 
 # Skip any input PDF whose <stem>.pdf already exists in OUTPUT_DIR.
 SKIP_EXISTING_OUTPUT = True
-
-# Render resolution.  300 DPI gives both Surya and TrOCR enough detail on
-# aged newsprint without creating impractically large tensors.
+ 
+# Render resolution.
 DPI = 300
-
+ 
 # ── Branding / document metadata ──────────────────────────────────────────────
 APP_NAME      = "Opticolumns"
 APP_VERSION   = "2026"
-APP_CREATOR   = f"{APP_NAME} {APP_VERSION}"          # "Opticolumns 2026"
+APP_CREATOR   = f"{APP_NAME} {APP_VERSION}"
 DOC_SUBJECT   = "OCR-processed historic newspaper"
-DOC_LANGUAGE  = "en-US"                              # BCP-47; written to XMP + /Lang
-# Namespace for the custom opt: XMP properties (declared via a PDF/A extension schema)
+DOC_LANGUAGE  = "en-US"
 OPT_NAMESPACE = "hhttps://github.com/Scholarly-Projects/opticolumns"
-
+ 
 # ── TrOCR model selection ─────────────────────────────────────────────────────
-# large_handwritten performs best on aged/degraded historic newspaper type.
-# Switch to large_printed for cleaner modern scans.
 TROCR_MODELS = {
     "handwritten":       "microsoft/trocr-base-handwritten",
     "printed":           "microsoft/trocr-base-printed",
     "large_handwritten": "microsoft/trocr-large-handwritten",
     "large_printed":     "microsoft/trocr-large-printed",
 }
+# Unchanged.  Worth one A/B run with "large_printed" on a distorted page: the
+# handwritten checkpoint is trained to guess through irregular strokes, which
+# is helpful on worn type but encourages invention on type that is gone.
 TROCR_MODEL_NAME = TROCR_MODELS["large_handwritten"]
-
+ 
 # ── TrOCR noise-filter thresholds ────────────────────────────────────────────
-
-CONFIDENCE_THRESHOLD             = 0.25   # minimum mean token confidence
-SINGLE_CHAR_CONFIDENCE_THRESHOLD = 0.50   # tighter threshold for 1-char results
-MIN_LINE_H                       = 5      # px — skip lines shorter than this
-MIN_LINE_W                       = 10     # px — skip lines narrower than this
-SPARSE_LINE_WIDTH_RATIO          = 2.0    # width / (height * char count) above this
-
-# TrOCR generation cap (tokens).  Without an explicit cap, long column lines can
-# be truncated by the checkpoint's default generation length.
-MAX_NEW_TOKENS = 192
-
-# ── Recall sweep (safety-net for text the layout model never boxed) ──────────
-# After region OCR, the whole page is tiled with overlap; every detected text
-# line that is not already covered by an existing element is OCR'd and added.
-SWEEP_ENABLED        = True
-SWEEP_TILE           = 1920   # px per tile side (300 DPI ≈ 6.4 in)
-SWEEP_OVERLAP        = 960    # px; must exceed the longest line the sweep should recover
-                              # (broadsheet columns at 300 DPI run up to ~715 px)
-SWEEP_EDGE_MARGIN    = 6      # px; boxes touching an interior tile edge are ignored
-SWEEP_COVERED_FRAC   = 0.50   # candidate counts as "already read" above this overlap
-SWEEP_MIN_CONFIDENCE = 0.40   # stricter than CONFIDENCE_THRESHOLD: sweep also sees photos
-
-# ── Column bands (give recovered lines a sensible reading position) ──────────
-# Every non-page-wide layout region, of any height, claims its own x-range as
-# a "column body" — see _column_bands().  A run of recovered lines centred in
-# a genuinely unclaimed x-gap (a whole column the layout model skipped) is
-# slotted into reading order between the columns on either side of it,
-# instead of being attached to a neighbor.
-COLUMN_REGION_MAX_W_FRAC = 0.40   # regions wider than this share of the page (mastheads) are ignored
-COLUMN_GAP_MIN           = 150    # px; an x-gap at least this wide between claimed bands = unclaimed column
-
-# A cluster of recovered lines in an unclaimed gap is only treated as a whole
-# missed column (and relocated in reading order) if it clears BOTH of these —
-# a handful of stray lines (a coverage false-negative, a marginal duplicate)
-# stays at its original nearest-neighbor position instead, which is always
-# at worst a harmless local duplicate rather than being moved to an unrelated
-# part of the page.
-MIN_UNCLAIMED_COLUMN_LINES        = 5      # fewer recovered lines than this are not relocated
-MIN_UNCLAIMED_COLUMN_HEIGHT_FRAC  = 0.25   # cluster must span at least this fraction of the page height
-
-# Same-position elements are grouped into a visual row only if consecutive
-# lines' boxes overlap by more than this fraction of the smaller line's
-# height, AND their x-overlap is below ROW_MAX_X_OVERLAP (genuinely side by
-# side, not stacked) -- see _assign_visual_rows.
+ 
+# [DISTORTED] (0.25) — on legible type TrOCR's mean token confidence usually
+# sits well above this; smeared type drags it down.  Not a complete fix on its
+# own, because TrOCR stays confident about filler like "to" and "1907".
+CONFIDENCE_THRESHOLD             = 0.45
+ 
+# [DISTORTED] (0.50) — set above 1.0 so EVERY single-character read is
+# rejected.  On these pages a lone "0", "#" or "I" is almost always a blob,
+# and TrOCR reads those blobs with high confidence, so no lower value works.
+SINGLE_CHAR_CONFIDENCE_THRESHOLD = 1.01
+ 
+# [DISTORTED] (5 / 10) — detector boxes smaller than a real body-text line
+# (≈25–35 px tall at 300 DPI) are specks and streak fragments, which is where
+# many "0" / "#" / "to" reads came from.  Body lines and ad text clear this.
+MIN_LINE_H                       = 12
+MIN_LINE_W                       = 40
+ 
+# [DISTORTED] (2.0) — rejects a 4+ character read whose box is far wider than
+# that many characters need (an under-read: a few plausible words read off a
+# long smeared line).  Legible body type sits around 0.4–0.7 here, and bold
+# spaced display type below ~1.0, so 1.2 keeps both.
+SPARSE_LINE_WIDTH_RATIO          = 1.2
+ 
+# [DISTORTED] (192) — a full column line is roughly 20–35 tokens.  A lower cap
+# cuts off run-on hallucination and repetition loops ("for # for your own ...")
+# early.  Wide headers are segmented before reading, so they are unaffected.
+MAX_NEW_TOKENS = 96
+ 
+# ── Recall sweep ──────────────────────────────────────────────────────────────
+# [DISTORTED] (True) — the sweep re-reads every line that no ACCEPTED element
+# covers, including the lines the region pass just rejected as noise, and so
+# gives each hallucination a second chance.  On a page like the sample,
+# Surya already boxes the legible ads, so the sweep's recall gain is small and
+# its false positives are many.  Disabling it also removes a second, sweep-
+# based source of doubled words like "Past Pastime".
+SWEEP_ENABLED        = False
+SWEEP_TILE           = 1920
+SWEEP_OVERLAP        = 960
+SWEEP_EDGE_MARGIN    = 6
+SWEEP_COVERED_FRAC   = 0.50
+# [DISTORTED] (0.40) — only matters if the sweep is switched back on.
+SWEEP_MIN_CONFIDENCE = 0.70
+ 
+# ── Column bands ──────────────────────────────────────────────────────────────
+COLUMN_REGION_MAX_W_FRAC = 0.40
+COLUMN_GAP_MIN           = 150
+ 
+MIN_UNCLAIMED_COLUMN_LINES        = 5
+MIN_UNCLAIMED_COLUMN_HEIGHT_FRAC  = 0.25
+ 
 ROW_OVERLAP_FRACTION = 0.5
 ROW_MAX_X_OVERLAP    = 0.5
-
+ 
 # ── Banner/masthead reading-order correction ──────────────────────────────────
-
-BANNER_BAND_OVERLAP_THRESHOLD = 0.18   # y-range overlap (as a fraction of the narrower
-                                        # region's height) required to count as one band
-BANNER_BAND_MIN_GAP_PX        = max(10, round(DPI * 0.06))  # px gap still counted as
-                                                              # the same band (scales with DPI)
-                                       # to resolve, instead of being repositioned next to it
-                                       # (see the in-loop comment in _reorder_banner_regions)
-
+ 
+BANNER_BAND_OVERLAP_THRESHOLD = 0.18
+BANNER_BAND_MIN_GAP_PX        = max(10, round(DPI * 0.06))
+ 
 SWEEP_COVERAGE_PAD = 6
-
+ 
 # ── Coverage audit (diagnostic; never changes the output) ────────────────────
-
+ 
 AUDIT_ENABLED     = True
-AUDIT_SCALE       = 8      # analyse the page at 1/8 size
-AUDIT_INK_LEVEL   = 215    # grey level (0-255) below which a reduced block counts as ink
-AUDIT_WARN_FRAC   = 0.08   # WARN if more than this share of the ink is uncovered
-AUDIT_MIN_BAND_PX = 150    # report uncovered vertical bands at least this wide
-
+AUDIT_SCALE       = 8
+AUDIT_INK_LEVEL   = 215
+# [DISTORTED] (0.08) — this preset deliberately leaves illegible columns
+# unread, so a large uncovered share is expected.  The band report still
+# flags any whole column that went missing.
+AUDIT_WARN_FRAC   = 0.35
+AUDIT_MIN_BAND_PX = 150
+ 
 # ── Debug output ──────────────────────────────────────────────────────────────
-# True  → one rolling set of debug files (latest_*.jpg, latest_*.txt),
-#         overwritten by every page, so the debug folder does not grow with
-#         batch size — covers the JPEGs AND the layout/OCR .txt reports.
-# False → separate files for every file/page.
 DEBUG_OVERWRITE = True
-
+ 
 # ── Layout label taxonomy ─────────────────────────────────────────────────────
-
+ 
 OCR_LABELS = {
-    "Text",              # body copy — primary article content
-    "Section-header",    # column and article headlines
-    "Caption",           # photo / illustration captions
-    "Footnote",          # editorial notes, source citations
-    "List-item",         # bulleted or numbered list entries
-    "Page-footer",       # pagination lines, print datelines
-    "Page-header",       # masthead, volume / issue / date strip
-    "Table-of-contents", # index entries (text, not grid structure)
-    "Handwriting",       # editorial annotations, marginalia
-    "Text-inline-math",  # inline mathematical notation within prose
-    "Formula",           # display equations
-    "Table",             # stock quotes, box scores, schedules — full of text
-    "Form",              # coupons, order forms, notices
+    "Text",
+    "Section-header",
+    "Caption",
+    "Footnote",
+    "List-item",
+    "Page-footer",
+    "Page-header",
+    "Table-of-contents",
+    "Handwriting",
+    "Text-inline-math",
+    "Formula",
+    "Table",
+    "Form",
 }
 SKIP_LABELS = {
-    "Picture",   # photographs — sweep recovers any embedded text
-    "Figure",    # diagrams / charts — sweep recovers any embedded text
+    "Picture",
+    "Figure",
 }
-
-# Labels that are typically single large text blocks filling the entire crop.
-# For these, DetectionPredictor often returns nothing because there are no
-# inter-line whitespace boundaries.  They always receive the two-pass treatment.
+ 
+# [DISTORTED] (adds "Caption", "Footnote") — labels here ALWAYS get a whole-crop
+# read, and it replaces the line-by-line result whenever it returns more
+# characters.  On a corrupted page a multi-line caption/footnote block squeezed
+# into one TrOCR input produces a long fluent invention that "wins" on length.
+# Without them in this set, those blocks fall back to whole-crop only when
+# no line is accepted at all.
 SINGLE_BLOCK_LABELS = {
     "Section-header",
     "Page-header",
-    "Caption",
-    "Footnote",
 }
-
-# Labels treated as bold/stylized display type (headlines, masthead) rather
-# than body copy — a subset of SINGLE_BLOCK_LABELS.  Caption/Footnote are
-# normal-weight text at body-ish size and don't need the treatment below.
+ 
 HEADER_LABELS = {
     "Section-header",
     "Page-header",
 }
-
-# "Page furniture" — headline/masthead-type content.  Used to break ties when
-
+ 
 FURNITURE_LABELS = HEADER_LABELS | {"Page-footer", "Table-of-contents"}
-
+ 
 DEDUPE_CONTAINMENT = 0.5
-
+ 
 DEDUPE_MAX_AREA_RATIO = 3.0
-
-HEADER_AUTOCONTRAST_CUTOFF = 1     # cutoff % for ImageOps.autocontrast
-
-MAX_HEADER_AR         = 10.0    # width / height threshold that triggers splitting
-HEADER_SEGMENT_OVERLAP = 0.20  # fraction of segment width shared with the next segment
-
+ 
+HEADER_AUTOCONTRAST_CUTOFF = 1
+ 
+# [DISTORTED] (6.0 / 0.20) — addresses "Go to The Past Pastime".  With overlap,
+# a word cut at a segment boundary is read twice ("Past" + "Pastime") and the
+# joiner only removes EXACT repeats.  Zero overlap means no text is ever read
+# twice; the cost is that a word straddling a cut may come out as two
+# fragments.  Raising the aspect-ratio limit cuts ad lines like "Go to The
+# Pastime" (≈15:1) into fewer pieces, so fewer words sit on a boundary.
+MAX_HEADER_AR          = 10.0
+HEADER_SEGMENT_OVERLAP = 0.0
+ 
 ELEMENT_SEPARATOR = " "
-
-# Minimum pixel dimensions for a region to bother processing.
+ 
 MIN_REGION_W = 40
 MIN_REGION_H = 15
-
+ 
 # ── PDF/A font & colour-profile resources ─────────────────────────────────────
-# EMBED_FONT = True  → hidden text uses FreeSans; PyMuPDF embeds it and, with
-#                      fonttools installed, subsets it to the glyphs used.
-#                      If the font file cannot be obtained the script falls back
-#                      to PyMuPDF's built-in "helv" substitute, which TextWriter
-#                      also embeds (bulkier: unsubset) — still PDF/A-safe.
-#                      NEVER switch the text layer to page.insert_text(
-#                      fontname="helv"): that leaves a non-embedded base-14
-#                      reference, which PDF/A forbids.
 EMBED_FONT    = True
-MIN_FONT_PT         = 4.0    # smallest initial font size for the hidden text
-MIN_CLAMPED_FONT_PT = 1.5    # floor when shrinking a line to fit its segment; the
-                             # text is invisible, so legibility is irrelevant —
-                             # only alignment with the printed line matters
-FONT_NAME     = "helv"                       # fallback (non-embedded) font only
+MIN_FONT_PT         = 4.0
+MIN_CLAMPED_FONT_PT = 1.5
+FONT_NAME     = "helv"
 FONT_PATH     = "fonts/FreeSans.ttf"
 FONT_URL      = ("https://github.com/opensourcedesign/fonts/raw/master/"
                  "gnu-freefont_freesans/FreeSans.ttf")
 SRGB_ICC_PATH = "srgb.icc"
-
+ 
 # Debug colour palette keyed on layout label
 LABEL_COLOURS: Dict[str, str] = {
     "Page-header":       "#1565C0",
@@ -238,7 +229,7 @@ LABEL_COLOURS: Dict[str, str] = {
     "Handwriting":       "#AD1457",
     "Form":              "#FF6F00",
     "Table-of-contents": "#0277BD",
-    "Recovered":         "#FFD600",   # lines found by the recall sweep
+    "Recovered":         "#FFD600",
 }
 DEFAULT_COLOUR = "#9E9E9E"
 
