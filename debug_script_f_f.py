@@ -82,10 +82,16 @@ RULE_SPLIT_MIN_YFRAC   = 0.5      # rule must run alongside ≥ 50 % of the regi
 
 # ── TrOCR ─────────────────────────────────────────────────────────────────────
 TROCR_MODELS = {
+    "handwritten":       "microsoft/trocr-base-handwritten",
+    "printed":           "microsoft/trocr-base-printed",
     "large_handwritten": "microsoft/trocr-large-handwritten",
+    "large_printed":     "microsoft/trocr-large-printed",
 }
 TROCR_MODEL_NAME          = TROCR_MODELS["large_handwritten"]
-TROCR_FALLBACK_MODEL_NAME = None      # no second-opinion model
+# Second opinion: lines the primary model reads with confidence below
+# FALLBACK_BELOW_CONF are re-read by this model and the more confident reading
+# is kept.  Set to None to disable (halves peak memory).
+TROCR_FALLBACK_MODEL_NAME = TROCR_MODELS["large_printed"]
 FALLBACK_BELOW_CONF       = 0.80
 FALLBACK_SWITCH_MARGIN    = 0.03   # fallback must beat primary by this much
 
