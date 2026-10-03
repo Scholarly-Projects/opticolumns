@@ -32,7 +32,7 @@ _Andrew Weymouth, Fall 2026._
 <details>
 <summary><h2>Additional Scripts</h2></summary>
 
-In addition to the script.py OCR code, there are two additional scripts for reviewing and benchmarking output. After the `script.py` generates a new PDF of your original documents in the A folder, the `review.py` generates a jpeg of all of the processed PDF files that have been created in your B folder. These images in the C folder will have the original image of your document on the left hand side and an isolated copy of its OCR on the right. Only the first page of every document will be produced so you can quickly scan for accuracy of materials and/or adjust TROCR Models or configuration accordingly.
+In addition to the script.py OCR code, there are two additional scripts for reviewing and benchmarking output. After the `script.py` generates a new PDF of your original documents in the A folder, the `review.py` generates a jpeg of all of the processed PDF files that have been created in your B folder. These images in the C folder will have the original image of your document on the left hand side and an isolated copy of its OCR on the right. Only the first page of every document will be produced so you can quickly scan for accuracy of materials and/or adjust TrOCR Models or configuration accordingly.
 
 Example output:
 
@@ -45,7 +45,7 @@ To understand the overall accuracy of the output, the `report.py` uses regular e
 <details>
 <summary><h2>Note</h2></summary>
 
-The Opticolumn tool kit are designed for **archival scans**, not born-digital PDFs. They add a new PDF/A-compliant OCR layer, or replace an existing one, but they do not add a tagging structure, alt text or the other elements a file needs to meet WCAG 2.1 standards.
+The Opticolumn tool kit is designed for **archival scans**, not born-digital PDFs. They add a new PDF/A-compliant OCR layer, or replace an existing one, but they do not add a tagging structure, alt text or the other elements a file needs to meet WCAG 2.1 standards.
 
 If a born-digital PDF is processed, the tool strips its text and images and leaves a largely blank document. Automatic detection produced too many false positives across the variety of born-digital files, so batches need a quick manual review.
 
