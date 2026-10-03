@@ -15,6 +15,9 @@ huggingface-hub>=0.30.0
 tokenizers>=0.20.0
 safetensors>=0.6.0
 
+# Spell checking (review / report scripts)
+pyspellchecker>=0.8.0
+
 # Utilities
 tqdm>=4.66.0
 requests>=2.31.0
@@ -23,5 +26,3 @@ fsspec>=2024.6.0
 
 # OpenCV (required by Surya)
 opencv-python-headless>=4.10.0
-
-# torch already installed from nightly
