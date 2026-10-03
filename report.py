@@ -20,7 +20,7 @@ INPUT_DIR  = "A"        # Original PDFs
 OUTPUT_DIR = "B"        # OCR-processed PDFs
 REPORT_DIR = "D"        # CSV output destination
 
-TOOL_NAME    = "Opticolumn"
+TOOL_NAME    = "Opticolumns"
 TOOL_VERSION = "2026"
 
 # Local names, places and acronyms that are real words for this collection
