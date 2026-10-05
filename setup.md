@@ -44,6 +44,17 @@ _To keep your Mac awake during long batches:_
 caffeinate -i python script.py    # prevents idle sleep
 caffeinate -di python script.py   # also keeps the display on
 ```
+## If a file stops the batch
+
+If processing stops with a message ending in `Killed`, a single PDF has used up the computer's memory. The culprit is the file named in the last message before `Killed`.
+
+**To try again**
+- Quit memory-heavy apps (browsers, Adobe apps, Photoshop) and run the script again.
+- Make sure at least 20 GB of disk space is free.
+- As a last resort, split the PDF into smaller sections, process each one, and recombine them.
+
+**To skip the file**
+- Move the culprit file from the `A` folder to the `review` folder, then run the script again.
 
 ## Windows
 
@@ -97,3 +108,14 @@ Reactivate the environment before running any script:
 source .venv/bin/activate         # macOS
 .venv\Scripts\Activate.ps1        # Windows
 ```
+## If a file stops the batch
+
+If processing stops with a message ending in `Killed`, a single PDF has used up the computer's memory. The culprit is the file named in the last message before `Killed`.
+
+**To try again**
+- Quit memory-heavy apps (browsers, Adobe apps, Photoshop) and run the script again.
+- Make sure at least 20 GB of disk space is free.
+- As a last resort, split the PDF into smaller sections, process each one, and recombine them.
+
+**To skip the file**
+- Move the culprit file from the `A` folder to the `review` folder, then run the script again.
